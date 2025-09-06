@@ -1,0 +1,29 @@
+{
+  "name": "github-notion-sync-plus",
+  "version": "1.0.0",
+  "description": "A Node.js application that synchronizes Notion databases with GitHub issues for bug tracking workflows",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js once",
+    "schedule": "node src/index.js schedule",
+    "schedule:custom": "node src/index.js schedule",
+    "dev": "node --watch src/index.js once",
+    "sync": "node src/index.js once",
+    "dry-run": "node src/index.js dry-run"
+  },
+  "keywords": ["notion", "github", "sync", "issues", "bug-tracking"],
+  "author": "Romel Luis Faife Cruz",
+  "license": "MIT",
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "@octokit/rest": "^20.0.2",
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
