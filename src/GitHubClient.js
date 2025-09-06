@@ -316,6 +316,46 @@ class GitHubClient {
             return false;
         }
     }
+
+    /**
+     * Delete a GitHub issue (requires admin/maintain permissions)
+     * @param {string} repo - Repository in format "owner/repo"
+     * @param {number} issueNumber - Issue number to delete
+     * @returns {boolean} Success status
+     */
+    async deleteIssue(repo, issueNumber) {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            this.logger.info(`Deleting GitHub issue #${issueNumber} in ${repo}`);
+            
+            // Note: GitHub doesn't have a direct "delete issue" API endpoint
+            // Instead, we need to use the Transfer API or close + lock the issue
+            // For now, we'll close and lock the issue as this is the closest to "deletion"
+            
+            // First close the issue
+            await this.octokit.rest.issues.update({
+                owner,
+                repo: repoName,
+                issue_number: issueNumber,
+                state: 'closed'
+            });
+            
+            // Then lock the issue to prevent further interaction
+            await this.octokit.rest.issues.lock({
+                owner,
+                repo: repoName,
+                issue_number: issueNumber,
+                lock_reason: 'resolved' // or 'off-topic', 'too heated', 'spam'
+            });
+            
+            this.logger.info(`Successfully deleted (closed and locked) issue #${issueNumber} in ${repo}`);
+            return true;
+        } catch (error) {
+            this.logger.error(`Error deleting issue #${issueNumber} in ${repo}:`, error);
+            throw error;
+        }
+    }
 }
 
 module.exports = GitHubClient;

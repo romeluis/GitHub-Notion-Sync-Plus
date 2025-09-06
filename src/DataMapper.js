@@ -31,7 +31,11 @@ class DataMapper {
      */
     mapGitHubStateToNotionStatus(githubState, currentNotionStatus = 'Reported') {
         if (githubState === 'closed') {
-            // If issue is closed in GitHub, mark as Fixed in Notion
+            // If issue is closed in GitHub and Notion status is already a closed state, keep it
+            if (['Fixed', 'Rejected'].includes(currentNotionStatus)) {
+                return currentNotionStatus;
+            }
+            // Otherwise, default to Fixed for closed issues
             return 'Fixed';
         }
         

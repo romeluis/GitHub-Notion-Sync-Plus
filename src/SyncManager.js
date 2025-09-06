@@ -11,6 +11,7 @@ class SyncManager {
     }
 
     /**
+     * Perfor    /**
      * Perform full bidirectional sync between Notion and GitHub
      * @returns {Object} Sync results summary
      */
@@ -181,18 +182,47 @@ class SyncManager {
 
         // Check if GitHub issue state needs to be updated based on Notion status
         const expectedGitHubState = this.mapper.mapNotionStatusToGitHubState(bug.status);
-        if (issue.state !== expectedGitHubState) {
+        const githubNeedsUpdate = issue.state !== expectedGitHubState;
+        
+        // Check if Notion status needs to be updated based on GitHub state
+        const expectedNotionStatus = this.mapper.mapGitHubStateToNotionStatus(issue.state, bug.status);
+        const notionNeedsUpdate = bug.status !== expectedNotionStatus;
+
+        // Prevent conflicting updates in the same sync cycle
+        if (githubNeedsUpdate && notionNeedsUpdate) {
+            // Use update timestamps to determine which changed more recently
+            const notionUpdated = new Date(bug.lastModified || 0);
+            const githubUpdated = new Date(issue.updated_at || 0);
+            
+            if (notionUpdated >= githubUpdated) {
+                // Notion was updated more recently, sync to GitHub
+                this.logger.info(`Notion bug ${bug.id} updated more recently (${notionUpdated.toISOString()}) than GitHub issue (${githubUpdated.toISOString()}), syncing to GitHub`);
+                operations.push(this.mapper.createSyncOperation(
+                    'update_github_state',
+                    bug,
+                    issue,
+                    `Notion status "${bug.status}" updated more recently, requires GitHub state "${expectedGitHubState}"`
+                ));
+            } else {
+                // GitHub was updated more recently, sync to Notion
+                this.logger.info(`GitHub issue #${issue.number} updated more recently (${githubUpdated.toISOString()}) than Notion bug (${notionUpdated.toISOString()}), syncing to Notion`);
+                operations.push(this.mapper.createSyncOperation(
+                    'update_notion_status',
+                    bug,
+                    issue,
+                    `GitHub state "${issue.state}" updated more recently, requires Notion status "${expectedNotionStatus}"`
+                ));
+            }
+        } else if (githubNeedsUpdate) {
+            // Only GitHub needs update
             operations.push(this.mapper.createSyncOperation(
                 'update_github_state',
                 bug,
                 issue,
                 `Notion status "${bug.status}" requires GitHub state "${expectedGitHubState}"`
             ));
-        }
-
-        // Check if Notion status needs to be updated based on GitHub state
-        const expectedNotionStatus = this.mapper.mapGitHubStateToNotionStatus(issue.state, bug.status);
-        if (bug.status !== expectedNotionStatus) {
+        } else if (notionNeedsUpdate) {
+            // Only Notion needs update
             operations.push(this.mapper.createSyncOperation(
                 'update_notion_status',
                 bug,
@@ -360,22 +390,41 @@ class SyncManager {
     /**
      * Delete/close GitHub issue when bug is deleted from Notion
      * @param {Object} issue - GitHub issue object
-     * @returns {Object} Deletion result
+     * @returns {Object} Operation result
      */
     async deleteGitHubIssue(issue) {
-        this.logger.info(`Closing orphaned GitHub issue #${issue.githubId}`);
+        this.logger.info(`Deleting orphaned GitHub issue #${issue.githubId} from ${issue.repository}`);
         
-        // Add comment explaining why the issue is being closed
-        await this.github.addComment(
-            issue.repository,
-            issue.githubId,
-            'This issue is being closed because the corresponding bug was deleted from Notion.'
-        );
-        
-        // Close the issue
-        const closedIssue = await this.github.updateIssueState(issue.repository, issue.githubId, 'closed');
-        
-        return closedIssue;
+        try {
+            // Add comment explaining why the issue is being deleted
+            await this.github.addComment(
+                issue.repository,
+                issue.githubId,
+                'This issue is being deleted because the corresponding bug was removed from Notion. The issue will be closed and locked to prevent further interaction.'
+            );
+            
+            // Delete (close and lock) the issue
+            await this.github.deleteIssue(issue.repository, issue.githubId);
+            
+            this.logger.info(`Successfully deleted GitHub issue #${issue.githubId}`);
+            
+            return {
+                type: 'deleted',
+                repository: issue.repository,
+                issueNumber: issue.githubId,
+                success: true
+            };
+        } catch (error) {
+            this.logger.error(`Failed to delete GitHub issue #${issue.githubId}:`, error);
+            
+            return {
+                type: 'deleted',
+                repository: issue.repository,
+                issueNumber: issue.githubId,
+                success: false,
+                error: error.message
+            };
+        }
     }
 }
 
