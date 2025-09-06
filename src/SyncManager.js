@@ -11,11 +11,27 @@ class SyncManager {
     }
 
     /**
-     * Perform full synchronization between Notion and GitHub
+     * Perform full bidirectional sync between Notion and GitHub
      * @returns {Object} Sync results summary
      */
     async performFullSync() {
         this.logger.info('Starting full synchronization...');
+        
+        // Validate GitHub permissions first
+        try {
+            const permissions = await this.github.validatePermissions();
+            this.logger.info(`GitHub permissions validated for user: ${permissions.user}`);
+            
+            if (!permissions.canCreateIssues) {
+                this.logger.warn('⚠️  GitHub token lacks full permissions for creating issues');
+                this.logger.warn('Current permissions allow reading but not creating issues');
+                this.logger.warn('Some operations may fail - consider updating token permissions');
+            }
+        } catch (error) {
+            this.logger.error('GitHub permission validation failed:', error.message);
+            // Don't throw here, continue with sync but log the warning
+            this.logger.warn('Continuing with sync despite permission validation failure');
+        }
         
         try {
             // Step 1: Fetch data from both sources
@@ -36,10 +52,25 @@ class SyncManager {
             const results = await this.executeSyncOperations(syncOperations);
 
             this.logger.info('Full synchronization completed');
-            return results;
-
-        } catch (error) {
-            this.logger.error('Full synchronization failed:', error);
+            return results;                } catch (error) {
+            if (error.message && error.message.includes('issues:write permission')) {
+                this.logger.error(`GitHub token permission issue: ${error.message}`);
+                this.logger.warn('To fix this issue:');
+                this.logger.warn('1. Go to https://github.com/settings/tokens');
+                this.logger.warn('2. Generate a new token or edit existing token');
+                this.logger.warn('3. Ensure the following permissions are selected:');
+                this.logger.warn('   - repo (Full control of private repositories) OR');
+                this.logger.warn('   - public_repo (Access public repositories) AND issues (Read/write access to issues)');
+                this.logger.warn('4. Update your GITHUB_TOKEN in the .env file');
+                
+                return {
+                    type: 'permission_error',
+                    bug: bug.id,
+                    error: 'GitHub token lacks issues:write permission'
+                };
+            }
+            
+            this.logger.error(`Failed to create GitHub issue for bug ${bug.id}:`, error);
             throw error;
         }
     }

@@ -2,11 +2,47 @@ const { Octokit } = require('@octokit/rest');
 const Logger = require('./Logger');
 
 class GitHubClient {
-    constructor(token) {
+    constructor(token, logger) {
+        this.token = token;
+        this.logger = logger;
         this.octokit = new Octokit({
             auth: token,
         });
-        this.logger = new Logger('GitHubClient');
+    }
+
+    /**
+     * Validate GitHub token permissions
+     * @returns {Object} Permissions information
+     */
+    async validatePermissions() {
+        try {
+            // Test token by getting user info
+            const userResponse = await this.octokit.rest.users.getAuthenticated();
+            const user = userResponse.data;
+            
+            // Get token scopes from response headers
+            const scopes = userResponse.headers['x-oauth-scopes'] || '';
+            const acceptedPermissions = userResponse.headers['x-accepted-github-permissions'] || '';
+            
+            this.logger.info(`GitHub token authenticated as: ${user.login}`);
+            this.logger.info(`Token scopes: ${scopes}`);
+            this.logger.info(`Accepted permissions: ${acceptedPermissions}`);
+            
+            // Check if we have necessary permissions
+            const hasRepoAccess = scopes.includes('repo') || scopes.includes('public_repo');
+            const hasIssuesWrite = scopes.includes('repo') || acceptedPermissions.includes('issues=write');
+            
+            return {
+                user: user.login,
+                scopes: scopes.split(', ').filter(s => s.length > 0),
+                hasRepoAccess,
+                hasIssuesWrite,
+                canCreateIssues: hasRepoAccess && hasIssuesWrite
+            };
+        } catch (error) {
+            this.logger.error('Failed to validate GitHub token:', error);
+            throw new Error(`GitHub token validation failed: ${error.message}`);
+        }
     }
 
     /**
@@ -119,6 +155,10 @@ class GitHubClient {
             const labels = this.determineLabels(bug);
             
             this.logger.info(`Creating new issue in ${repo}: ${title}`);
+            this.logger.info(`Owner: ${owner}, Repo: ${repoName}`);
+            this.logger.info(`Title: ${title}`);
+            this.logger.info(`Body: ${body}`);
+            this.logger.info(`Labels: ${JSON.stringify(labels)}`);
             
             const response = await this.octokit.rest.issues.create({
                 owner,
@@ -132,6 +172,17 @@ class GitHubClient {
             return this.formatIssueData(response.data, repo);
         } catch (error) {
             this.logger.error(`Error creating issue in ${repo}:`, error);
+            this.logger.error(`Error status: ${error.status}`);
+            this.logger.error(`Error message: ${error.message}`);
+            if (error.response) {
+                this.logger.error(`Error response data:`, error.response.data);
+            }
+            
+            if (error.status === 404) {
+                const detailedError = new Error(`Repository ${repo} not found or GitHub token lacks issues:write permission. Please check: 1) Repository exists, 2) Token has access to repository, 3) Token has issues:write permission, 4) Repository has issues enabled`);
+                detailedError.originalError = error;
+                throw detailedError;
+            }
             throw error;
         }
     }

@@ -30,7 +30,8 @@ class GitHubNotionSync {
             );
 
             this.github = new GitHubClient(
-                this.config.getGitHubToken()
+                this.config.getGitHubToken(),
+                this.logger
             );
 
             // Initialize sync manager
