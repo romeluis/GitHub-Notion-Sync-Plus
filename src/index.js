@@ -3,6 +3,7 @@ const GitHubClient = require('./GitHubClient');
 const SyncManager = require('./SyncManager');
 const ConfigManager = require('./ConfigManager');
 const Logger = require('./Logger');
+const WebhookHandler = require('./WebhookHandler');
 
 class GitHubNotionSync {
     constructor() {
@@ -11,6 +12,7 @@ class GitHubNotionSync {
         this.notion = null;
         this.github = null;
         this.syncManager = null;
+        this.webhookHandler = null;
     }
 
     /**
@@ -201,6 +203,47 @@ class GitHubNotionSync {
             throw error;
         }
     }
+
+    /**
+     * Start webhook server alongside scheduled sync
+     * @param {number} intervalMinutes - Sync interval in minutes
+     * @param {number} webhookPort - Port for webhook server
+     */
+    async runWithWebhooks(intervalMinutes = 5, webhookPort = 3000) {
+        try {
+            this.logger.info('Starting GitHub-Notion Sync Plus with webhook server...');
+
+            await this.initialize();
+
+            // Initialize webhook handler
+            this.webhookHandler = new WebhookHandler(
+                this.config,
+                this.github,
+                this.notion,
+                this.logger
+            );
+
+            // Start webhook server
+            await this.webhookHandler.start(webhookPort);
+
+            // Start scheduled sync (this will run indefinitely)
+            await this.runScheduled(intervalMinutes);
+
+        } catch (error) {
+            this.logger.error('Failed to start webhook server with sync:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Stop all services
+     */
+    async stop() {
+        if (this.webhookHandler) {
+            this.webhookHandler.stop();
+        }
+        this.logger.info('All services stopped');
+    }
 }
 
 // CLI interface
@@ -209,6 +252,7 @@ if (require.main === module) {
     
     const command = process.argv[2];
     const interval = parseInt(process.argv[3]) || 5; // Default 5 minutes
+    const webhookPort = parseInt(process.argv[4]) || 3000; // Default port 3000
     
     if (command === 'dry-run') {
         app.dryRun()
@@ -217,15 +261,31 @@ if (require.main === module) {
     } else if (command === 'schedule') {
         app.runScheduled(interval)
             .catch(() => process.exit(1));
+    } else if (command === 'webhook') {
+        // Run webhook server with scheduled sync
+        app.runWithWebhooks(interval, webhookPort)
+            .catch(() => process.exit(1));
     } else if (command === 'once') {
         app.runOnce()
             .then(() => process.exit(0))
             .catch(() => process.exit(1));
     } else {
-        // Default: run once
-        app.runOnce()
-            .then(() => process.exit(0))
-            .catch(() => process.exit(1));
+        console.log('GitHub-Notion Sync Plus');
+        console.log('Usage: node index.js [command] [options]');
+        console.log('');
+        console.log('Commands:');
+        console.log('  once                     Run sync once and exit');
+        console.log('  schedule [interval]      Run scheduled sync (default: 5 minutes)');
+        console.log('  webhook [interval] [port] Run webhook server with sync (default: 5min, port 3000)');
+        console.log('  dry-run                  Show what would be synced without making changes');
+        console.log('');
+        console.log('Examples:');
+        console.log('  node index.js once                    # Run once');
+        console.log('  node index.js schedule 3              # Sync every 3 minutes');
+        console.log('  node index.js webhook 5 3000          # Webhook + sync every 5min on port 3000');
+        console.log('  node index.js dry-run                 # Preview changes');
+        
+        process.exit(0);
     }
 }
 

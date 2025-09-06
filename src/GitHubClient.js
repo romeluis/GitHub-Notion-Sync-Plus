@@ -356,6 +356,56 @@ class GitHubClient {
             throw error;
         }
     }
+
+    /**
+     * Create a new branch from a source branch
+     * @param {string} repo - Repository in format "owner/repo"
+     * @param {string} branchName - Name of the new branch
+     * @param {string} sourceBranch - Source branch to create from (default: main)
+     * @returns {Object|null} Branch info or null if already exists
+     */
+    async createBranch(repo, branchName, sourceBranch = 'main') {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            this.logger.info(`Creating branch ${branchName} from ${sourceBranch} in ${repo}`);
+
+            // Get the SHA of the source branch
+            const { data: sourceRef } = await this.octokit.rest.git.getRef({
+                owner,
+                repo: repoName,
+                ref: `heads/${sourceBranch}`
+            });
+
+            // Create new branch
+            const { data: newBranch } = await this.octokit.rest.git.createRef({
+                owner,
+                repo: repoName,
+                ref: `refs/heads/${branchName}`,
+                sha: sourceRef.object.sha
+            });
+
+            this.logger.info(`Successfully created branch ${branchName} in ${repo}`, {
+                sha: newBranch.object.sha
+            });
+
+            return {
+                name: branchName,
+                sha: newBranch.object.sha,
+                url: `https://github.com/${repo}/tree/${branchName}`,
+                repository: repo
+            };
+
+        } catch (error) {
+            if (error.status === 422) {
+                this.logger.warn(`Branch ${branchName} already exists in ${repo}`);
+                return null;
+            }
+            
+            this.logger.error(`Failed to create branch ${branchName} in ${repo}:`, error);
+            throw error;
+        }
+    }
 }
 
 module.exports = GitHubClient;
