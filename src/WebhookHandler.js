@@ -249,7 +249,6 @@ class WebhookHandler {
         return new Promise((resolve) => {
             this.server = this.app.listen(port, () => {
                 this.logger.info(`Webhook server listening on port ${port}`);
-                this.logger.info(`Webhook URL: https://capstone.up-grade.ca/webhook/notion`);
                 resolve();
             });
         });
