@@ -4,7 +4,7 @@
   "description": "A Node.js application that synchronizes Notion databases with GitHub issues for bug tracking workflows",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js once",
+    "start": "node src/index.js webhook",
     "schedule": "node src/index.js schedule",
     "schedule:custom": "node src/index.js schedule",
     "webhook": "node src/index.js webhook",

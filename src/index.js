@@ -270,22 +270,10 @@ if (require.main === module) {
             .then(() => process.exit(0))
             .catch(() => process.exit(1));
     } else {
-        console.log('GitHub-Notion Sync Plus');
-        console.log('Usage: node index.js [command] [options]');
-        console.log('');
-        console.log('Commands:');
-        console.log('  once                     Run sync once and exit');
-        console.log('  schedule [interval]      Run scheduled sync (default: 5 minutes)');
-        console.log('  webhook [interval] [port] Run webhook server with sync (default: 5min, port 3000)');
-        console.log('  dry-run                  Show what would be synced without making changes');
-        console.log('');
-        console.log('Examples:');
-        console.log('  node index.js once                    # Run once');
-        console.log('  node index.js schedule 3              # Sync every 3 minutes');
-        console.log('  node index.js webhook 5 3000          # Webhook + sync every 5min on port 3000');
-        console.log('  node index.js dry-run                 # Preview changes');
-        
-        process.exit(0);
+        // Default to webhook mode with syncing if no command specified
+        console.log('No command specified, starting webhook server with scheduled sync...');
+        app.runWithWebhooks(interval, webhookPort)
+            .catch(() => process.exit(1));
     }
 }
 
