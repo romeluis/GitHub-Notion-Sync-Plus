@@ -1,4 +1,4 @@
-const express = require('express');
+ const express = require('express');
 const cors = require('cors');
 
 /**
@@ -25,7 +25,7 @@ class WebhookHandler {
         // Enable CORS for webhook endpoint
         this.app.use(cors({
             origin: ['https://notion.so', 'https://www.notion.so'],
-            methods: ['POST'],
+            methods: ['POST', 'GET'],
             allowedHeaders: ['Content-Type', 'Authorization']
         }));
 
@@ -36,7 +36,8 @@ class WebhookHandler {
         this.app.use((req, res, next) => {
             this.logger.info(`${req.method} ${req.path}`, {
                 userAgent: req.get('User-Agent'),
-                contentType: req.get('Content-Type')
+                contentType: req.get('Content-Type'),
+                ip: req.ip || req.connection.remoteAddress
             });
             next();
         });
@@ -55,7 +56,9 @@ class WebhookHandler {
                 status: 'ok', 
                 service: 'GitHub-Notion Sync Plus',
                 webhook: 'active',
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
+                uptime: process.uptime(),
+                version: '1.0.0'
             });
         });
 
@@ -63,11 +66,34 @@ class WebhookHandler {
         this.app.get('/', (req, res) => {
             res.json({
                 service: 'GitHub-Notion Sync Plus Webhook Server',
+                status: 'running',
+                timestamp: new Date().toISOString(),
                 endpoints: {
                     webhook: 'POST /webhook/notion',
-                    health: 'GET /health'
+                    health: 'GET /health',
+                    test: 'POST /webhook/test'
                 },
-                webhookUrl: `https://capstone.up-grade.ca/webhook/notion`
+                webhookUrl: `https://capstonesync.romeluis.com/webhook/notion`,
+                tunnelUrl: `http://localhost:3000`,
+                uptime: process.uptime()
+            });
+        });
+
+        // Test endpoint for webhook testing
+        this.app.post('/webhook/test', (req, res) => {
+            this.logger.info('Test webhook received', { 
+                body: req.body,
+                headers: {
+                    'content-type': req.get('Content-Type'),
+                    'user-agent': req.get('User-Agent')
+                },
+                query: req.query
+            });
+            res.json({
+                status: 'received',
+                message: 'Test webhook processed successfully',
+                receivedData: req.body,
+                timestamp: new Date().toISOString()
             });
         });
     }
@@ -81,44 +107,77 @@ class WebhookHandler {
         try {
             this.logger.info('Received Notion webhook action', { 
                 body: req.body,
-                headers: req.headers
+                headers: {
+                    'content-type': req.get('Content-Type'),
+                    'user-agent': req.get('User-Agent'),
+                    'content-length': req.get('Content-Length')
+                },
+                method: req.method,
+                url: req.url,
+                bodyType: typeof req.body,
+                bodyKeys: req.body ? Object.keys(req.body) : []
             });
+
+            // Validate request has body
+            if (!req.body || Object.keys(req.body).length === 0) {
+                this.logger.warn('Received webhook with empty body');
+                return res.status(400).json({ 
+                    error: 'Empty webhook payload',
+                    message: 'Webhook body is required'
+                });
+            }
 
             // Respond immediately to prevent timeout (Notion expects quick response)
             res.status(200).json({ 
                 status: 'received', 
-                timestamp: new Date().toISOString() 
+                timestamp: new Date().toISOString(),
+                message: 'Webhook received and will be processed asynchronously'
             });
 
             // Process webhook asynchronously to avoid blocking
-            setImmediate(() => this.processWebhookAsync(req.body));
+            setImmediate(() => this.processWebhookAsync(req.body, req.headers));
 
         } catch (error) {
             this.logger.error('Error handling webhook:', error);
-            res.status(500).json({ 
-                error: 'Webhook processing failed',
-                message: error.message
-            });
+            
+            // Only respond if headers haven't been sent
+            if (!res.headersSent) {
+                res.status(500).json({ 
+                    error: 'Webhook processing failed',
+                    message: error.message,
+                    timestamp: new Date().toISOString()
+                });
+            }
         }
     }
 
     /**
      * Process webhook data asynchronously
      * @param {Object} webhookData - Notion webhook action data
+     * @param {Object} headers - Request headers
      */
-    async processWebhookAsync(webhookData) {
+    async processWebhookAsync(webhookData, headers = {}) {
         try {
-            this.logger.info('Processing webhook action asynchronously', { webhookData });
+            this.logger.info('Processing webhook action asynchronously', { 
+                webhookData,
+                userAgent: headers['user-agent'],
+                contentType: headers['content-type']
+            });
 
-            // Check if this is a branch creation button action
+            // Check if this is a branch creation action
             if (this.isBranchCreationAction(webhookData)) {
+                this.logger.info('Webhook identified as branch creation action');
                 await this.createBranchFromWebhook(webhookData);
             } else {
-                this.logger.info('Webhook action not related to branch creation, ignoring');
+                this.logger.info('Webhook action not related to branch creation', {
+                    reason: 'Missing required fields (title, id, or module)',
+                    availableFields: Object.keys(webhookData || {})
+                });
             }
 
         } catch (error) {
             this.logger.error('Error processing webhook asynchronously:', error);
+            // Consider adding retry logic or dead letter queue here
         }
     }
 
@@ -128,26 +187,61 @@ class WebhookHandler {
      * @returns {boolean} True if this is a branch creation action
      */
     isBranchCreationAction(webhookData) {
-        // Notion webhook actions have specific structure
-        // We're looking for button clicks that trigger branch creation
-        return webhookData && 
-               webhookData.title && 
-               webhookData.id && 
-               webhookData.module && 
-               webhookData.type;
+        // Notion webhook actions send database page properties
+        // We need to look for properties that indicate a bug/task record
+        // Common properties might include: Title, ID, Module, Type, Status, etc.
+        
+        this.logger.info('Analyzing webhook payload structure', { 
+            keys: Object.keys(webhookData || {}),
+            payload: webhookData 
+        });
+
+        // Check for common Notion database properties
+        if (webhookData && typeof webhookData === 'object') {
+            // Look for title property (common in Notion databases)
+            const hasTitle = webhookData.Title || webhookData.title || webhookData.Name || webhookData.name;
+            // Look for ID property (like CBUG-1 or TSK-1)
+            const hasId = webhookData.ID || webhookData.id || webhookData['Bug ID'] || webhookData['Task ID'];
+            // Look for module/type properties
+            const hasModule = webhookData.Module || webhookData.module || webhookData.Component;
+            
+            this.logger.info('Webhook property analysis', {
+                hasTitle: !!hasTitle,
+                hasId: !!hasId,
+                hasModule: !!hasModule,
+                titleValue: hasTitle,
+                idValue: hasId,
+                moduleValue: hasModule
+            });
+
+            return !!(hasTitle && (hasId || hasModule));
+        }
+
+        return false;
     }
 
     /**
      * Create a branch based on webhook data
-     * @param {Object} webhookData - Contains title, id, module, type from Notion
+     * @param {Object} webhookData - Contains database properties from Notion
      */
     async createBranchFromWebhook(webhookData) {
         try {
-            const { title, id, module, type } = webhookData;
+            // Extract data from webhook payload (Notion database properties)
+            const title = this.extractTitle(webhookData);
+            const id = this.extractId(webhookData);
+            const module = this.extractModule(webhookData);
+            const type = this.extractType(webhookData);
             
             this.logger.info('Creating branch from webhook data', {
-                id, title, module, type
+                id, title, module, type, rawData: webhookData
             });
+
+            if (!title || !id) {
+                this.logger.error('Missing required data for branch creation', { 
+                    title, id, module, type 
+                });
+                return;
+            }
 
             // Get repository from module mapping
             const repository = this.getRepositoryFromModule(module);
@@ -181,6 +275,64 @@ class WebhookHandler {
         } catch (error) {
             this.logger.error('Error creating branch from webhook:', error);
         }
+    }
+
+    /**
+     * Extract title from webhook data
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} Title value
+     */
+    extractTitle(webhookData) {
+        return webhookData.Title || 
+               webhookData.title || 
+               webhookData.Name || 
+               webhookData.name || 
+               webhookData['Bug Title'] ||
+               webhookData['Task Title'] ||
+               null;
+    }
+
+    /**
+     * Extract ID from webhook data
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} ID value
+     */
+    extractId(webhookData) {
+        return webhookData.ID || 
+               webhookData.id || 
+               webhookData['Bug ID'] || 
+               webhookData['Task ID'] ||
+               webhookData.Number ||
+               webhookData.number ||
+               null;
+    }
+
+    /**
+     * Extract module from webhook data
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} Module value
+     */
+    extractModule(webhookData) {
+        return webhookData.Module || 
+               webhookData.module || 
+               webhookData.Component || 
+               webhookData.component ||
+               webhookData.Area ||
+               webhookData.area ||
+               'Application'; // Default fallback
+    }
+
+    /**
+     * Extract type from webhook data
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} Type value
+     */
+    extractType(webhookData) {
+        return webhookData.Type || 
+               webhookData.type || 
+               webhookData.Category || 
+               webhookData.category ||
+               'feature'; // Default fallback
     }
 
     /**
@@ -249,6 +401,9 @@ class WebhookHandler {
         return new Promise((resolve) => {
             this.server = this.app.listen(port, () => {
                 this.logger.info(`Webhook server listening on port ${port}`);
+                this.logger.info(`Health check: http://localhost:${port}/health`);
+                this.logger.info(`Webhook URL: http://localhost:${port}/webhook/notion`);
+                this.logger.info(`Test endpoint: http://localhost:${port}/webhook/test`);
                 resolve();
             });
         });
