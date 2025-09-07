@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<instructions>
+    <project>
+        <name>GitHub-Notion Sync Plus</name>
+        <description>
+            A Node.js application that synchronizes Notion databases with GitHub issues,
+            specifically designed to manage bug tracking workflows between both platforms.
+        </description>
+        <version>1.0.0</version>
+        <author>Romel Luis Faife Cruz</author>
+    </project>
+
+    <environment>
+        <variables>
+            <variable name="NOTION_TOKEN" required="true" description="Notion API integration token"/>
+            <variable name="GITHUB_TOKEN" required="true" description="GitHub personal access token with repo permissions"/>
+            <variable name="BUG_DATABASE_ID" required="true" description="Notion database ID for bugs"/>
+            <variable name="MODULE_MAPPING" required="true" description="JSON mapping of Notion modules to GitHub repositories"/>
+        </variables>
+        <example_env_file>
+            NOTION_TOKEN=ntn_your_notion_token_here
+            GITHUB_TOKEN=github_pat_your_github_token_here
+            BUG_DATABASE_ID=your_notion_database_id
+            MODULE_MAPPING={"Application":"romeluis/Haptic-Belt-Application","Firmware":"romeluis/Haptic-Belt-Firmware"}
+        </example_env_file>
+    </environment>
+
+    <database_schemas>
+        <notion_bugs_database>
+            <field name="ID" type="unique_id" format="CBUG-[number]" description="Unique bug identifier"/>
+            <field name="Bug Title" type="rich_text" description="Title for the GitHub issue"/>
+            <field name="Status" type="status" description="Bug status">
+                <options>
+                    <option>Reported</option>
+                    <option>Blocked</option>
+                    <option>In Progress</option>
+                    <option>In Review</option>
+                    <option>Rejected</option>
+                    <option>Fixed</option>
+                </options>
+            </field>
+            <field name="Type" type="select" description="Bug severity/type">
+                <options>
+                    <option>Functionality</option>
+                    <option>Fatal</option>
+                    <option>Cosmetic</option>
+                </options>
+            </field>
+            <field name="Description" type="rich_text" description="Detailed bug description"/>
+            <field name="Steps to Reproduce" type="rich_text" description="Steps to reproduce the bug"/>
+            <field name="Module" type="select" description="Target repository">
+                <options>
+                    <option>Application</option>
+                    <option>Firmware</option>
+                </options>
+            </field>
+            <field name="Issue Link" type="url" description="Direct link to the corresponding GitHub issue (automatically populated)"/>
+        </notion_bugs_database>
+    </database_schemas>
+
+    <github_integration>
+        <issue_format>
+            <title_format>[type]/[ID] [Title]</title_format>
+            <description_template>
+                ## Description
+                {description}
+
+                ## Steps to Reproduce
+                {steps_to_reproduce}
+
+                ---
+                *This issue was automatically created from Notion bug {id}*
+            </description_template>
+        </issue_format>
+        <labels>
+            <label name="bug" description="Issues that report bugs"/>
+            <label name="notion-sync" description="Issues synced from Notion"/>
+            <label name="functionality" condition="type=Functionality"/>
+            <label name="fatal" condition="type=Fatal"/>
+            <label name="cosmetic" condition="type=Cosmetic"/>
+        </labels>
+    </github_integration>
+
+    <sync_rules>
+        <notion_to_github>
+            <rule>When new bug is created in Notion, create corresponding GitHub issue and populate Issue Link field</rule>
+            <rule>When bug status changes to "Fixed" in Notion, close GitHub issue</rule>
+            <rule>When bug is deleted in Notion, close and delete GitHub issue if possible</rule>
+        </notion_to_github>
+        <github_to_notion>
+            <rule>When GitHub issue is closed, update Notion bug status to "Fixed"</rule>
+            <rule>When GitHub issue is reopened, update Notion bug status to "Reported"</rule>
+            <rule>When GitHub issue exists but Notion bug lacks Issue Link, populate the link</rule>
+        </github_to_notion>
+    </sync_rules>
+
+    <implementation_workflow>
+        <phase number="1" name="Notion Data Import">
+            <task>Implement NotionClient class for database queries</task>
+            <task>Create method to fetch all bugs from database</task>
+            <task>Parse and structure Notion data</task>
+            <validation>Verify all bug fields are correctly extracted</validation>
+        </phase>
+        
+        <phase number="2" name="GitHub Data Import">
+            <task>Implement GitHubClient class for API interactions</task>
+            <task>Create method to fetch issues from repositories</task>
+            <task>Filter issues created by this sync tool</task>
+            <validation>Verify all relevant issues are retrieved</validation>
+        </phase>
+        
+        <phase number="3" name="Data Comparison and Sync">
+            <task>Implement comparison logic between Notion and GitHub data</task>
+            <task>Create sync operations for creating, updating, and deleting</task>
+            <task>Handle status synchronization in both directions</task>
+            <validation>Test all sync scenarios with sample data</validation>
+        </phase>
+        
+        <phase number="4" name="Error Handling and Logging">
+            <task>Implement comprehensive error handling</task>
+            <task>Add detailed logging for sync operations</task>
+            <task>Create rollback mechanisms for failed operations</task>
+            <validation>Test error scenarios and recovery</validation>
+        </phase>
+        
+        <phase number="5" name="Testing and Deployment">
+            <task>Create unit tests for all components</task>
+            <task>Perform end-to-end testing</task>
+            <task>Document deployment procedures</task>
+            <validation>Full system validation with real data</validation>
+        </phase>
+    </implementation_workflow>
+
+    <architecture>
+        <components>
+            <component name="NotionClient" file="src/NotionClient.js" description="Handles all Notion API interactions"/>
+            <component name="GitHubClient" file="src/GitHubClient.js" description="Handles all GitHub API interactions"/>
+            <component name="SyncManager" file="src/SyncManager.js" description="Orchestrates synchronization logic"/>
+            <component name="DataMapper" file="src/DataMapper.js" description="Maps data between Notion and GitHub formats"/>
+            <component name="ConfigManager" file="src/ConfigManager.js" description="Manages environment variables and configuration"/>
+            <component name="Logger" file="src/Logger.js" description="Centralized logging system"/>
+            <component name="WebhookHandler" file="src/WebhookHandler.js" description="Processes Notion webhook actions for branch creation"/>
+        </components>
+        <entry_point file="src/index.js" description="Main application entry point with CLI interface"/>
+    </architecture>
+
+    <future_enhancements>
+        <enhancement name="Webhook Integration" description="✅ IMPLEMENTED - Real-time webhook actions for branch creation" status="completed"/>
+        <enhancement name="Branch Creation" description="✅ IMPLEMENTED - Automatic branch creation from Notion webhook actions" status="completed"/>
+        <enhancement name="Advanced Filtering" description="Support for custom sync rules and filters"/>
+        <enhancement name="Multiple Databases" description="Support syncing multiple Notion databases"/>
+    </future_enhancements>
+
+    <webhook_integration>
+        <description>
+            Phase 2 implementation adds webhook action support for real-time branch creation.
+            The application can run both scheduled sync and webhook server simultaneously.
+        </description>
+        
+        <webhook_actions>
+            <action name="branch_creation" description="Create GitHub branches from Notion button actions">
+                <trigger>Notion webhook action from Bug or Task database button</trigger>
+                <payload>
+                    <field name="title" description="Bug/Task title"/>
+                    <field name="id" description="Bug ID (CBUG-#) or Task ID (TSK-#)"/>
+                    <field name="module" description="Target module (Application/Firmware)"/>
+                    <field name="type" description="Issue type (Functionality/Fatal/Cosmetic)"/>
+                </payload>
+                <result>
+                    <action>Create GitHub branch with format: feature/CBUG-1-bug-title or task/TSK-1-task-title</action>
+                    <action>Update Notion with branch link (if possible)</action>
+                </result>
+            </action>
+        </webhook_actions>
+
+        <server_configuration>
+            <host>capstone.up-grade.ca</host>
+            <webhook_endpoint>/webhook/notion</webhook_endpoint>
+            <health_endpoint>/health</health_endpoint>
+            <port>3000</port>
+        </server_configuration>
+
+        <implementation_notes>
+            <note>Webhook processing is asynchronous to prevent blocking sync operations</note>
+            <note>Server responds immediately to webhook requests to prevent timeouts</note>
+            <note>Both Bug (CBUG-#) and Task (TSK-#) databases are supported</note>
+            <note>Branch names are sanitized and limited to 40 characters</note>
+            <note>Webhook server and sync scheduler run concurrently</note>
+        </implementation_notes>
+    </webhook_integration>
+
+    <phase_2_implementation>
+        <phase number="6" name="Webhook Integration and Branch Creation">
+            <task>Implement WebhookHandler class for Notion webhook actions</task>
+            <task>Add branch creation functionality to GitHubClient</task>
+            <task>Create Express server with CORS support</task>
+            <task>Integrate webhook server with existing sync scheduler</task>
+            <task>Add CLI commands for webhook server management</task>
+            <validation>Test webhook actions trigger branch creation</validation>
+            <validation>Verify sync operations continue during webhook processing</validation>
+        </phase>
+    </phase_2_implementation>
+</instructions>
