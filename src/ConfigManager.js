@@ -1,4 +1,3 @@
-require('dotenv').config({ override: true });
 const Logger = require('./Logger');
 const fs = require('fs');
 const path = require('path');
@@ -43,17 +42,6 @@ class ConfigManager {
      * @returns {string} GitHub token
      */
     getGitHubToken() {
-        // Force read from .env file to avoid environment variable conflicts
-        try {
-            const envPath = path.join(process.cwd(), '.env');
-            const envContent = fs.readFileSync(envPath, 'utf8');
-            const match = envContent.match(/^GITHUB_TOKEN=(.+)$/m);
-            if (match && match[1]) {
-                return match[1].trim();
-            }
-        } catch (error) {
-            this.logger.warn('Could not read .env file directly, falling back to process.env');
-        }
         return process.env.GITHUB_TOKEN;
     }
 

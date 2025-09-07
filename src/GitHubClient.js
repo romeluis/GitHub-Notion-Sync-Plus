@@ -5,9 +5,28 @@ class GitHubClient {
     constructor(token, logger) {
         this.token = token;
         this.logger = logger;
-        this.octokit = new Octokit({
-            auth: token,
-        });
+        
+        // Configure Octokit based on token format
+        let authConfig;
+        
+        if (token?.startsWith('github_pat_')) {
+            // Fine-grained personal access token
+            authConfig = {
+                auth: token
+            };
+        } else if (token?.startsWith('ghp_')) {
+            // Classic personal access token
+            authConfig = {
+                auth: token
+            };
+        } else {
+            // Default configuration
+            authConfig = {
+                auth: token
+            };
+        }
+        
+        this.octokit = new Octokit(authConfig);
     }
 
     /**

@@ -1,3 +1,6 @@
+// Load environment variables at the very beginning
+require('dotenv').config();
+
 const NotionClient = require('./NotionClient');
 const GitHubClient = require('./GitHubClient');
 const SyncManager = require('./SyncManager');
