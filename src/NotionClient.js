@@ -56,6 +56,7 @@ class NotionClient {
             stepsToReproduce: this.extractTextFromProperty(properties['Steps to Reproduce']),
             module: this.extractSelectFromProperty(properties.Module),
             issueLink: this.extractUrlFromProperty(properties['Issue Link']),
+            branchUrl: this.extractUrlFromProperty(properties['Branch Link']),
             lastModified: page.last_edited_time,
             url: page.url
         };
@@ -209,6 +210,12 @@ class NotionClient {
             if (updates.issueUrl) {
                 properties['Issue Link'] = {
                     url: updates.issueUrl
+                };
+            }
+
+            if (updates.branchUrl) {
+                properties['Branch Link'] = {
+                    url: updates.branchUrl
                 };
             }
             

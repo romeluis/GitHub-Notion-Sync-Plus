@@ -158,19 +158,20 @@ class GitHubClient {
      * Create a new GitHub issue from Notion bug data
      * @param {string} repo - Repository in format "owner/repo"
      * @param {Object} bug - Notion bug data
+     * @param {string} branchUrl - Optional branch URL to include in issue body
      * @returns {Object} Created issue object
      */
-    async createIssue(repo, bug) {
+    async createIssue(repo, bug, branchUrl = null) {
         try {
             const [owner, repoName] = repo.split('/');
             
-            // Format title: [type]/[ID] [Title]
-            const title = `[${bug.type}]/${bug.id} ${bug.title}`;
+            // Format title: ID: Title → CBUG-2: Test Bug Fix
+            const title = `${bug.id}: ${bug.title}`;
             
-            // Format description with bug details
-            const body = this.formatIssueBody(bug);
+            // Format description with bug details and optional branch URL
+            const body = this.formatIssueBody(bug, branchUrl || bug.branchUrl);
             
-            // Determine labels based on bug properties
+            // Determine labels based on bug properties (including type)
             const labels = this.determineLabels(bug);
             
             this.logger.info(`Creating new issue in ${repo}: ${title}`);
@@ -206,6 +207,7 @@ class GitHubClient {
         }
     }
 
+    /**
     /**
      * Update GitHub issue state (close/reopen)
      * @param {string} repo - Repository in format "owner/repo"
@@ -263,11 +265,39 @@ class GitHubClient {
     }
 
     /**
+     * Update GitHub issue body
+     * @param {string} repo - Repository in format "owner/repo"
+     * @param {number} issueNumber - GitHub issue number
+     * @param {string} body - New issue body
+     * @returns {Object} Updated issue object
+     */
+    async updateIssueBody(repo, issueNumber, body) {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            this.logger.info(`Updating body for issue #${issueNumber} in ${repo}`);
+            
+            const response = await this.octokit.rest.issues.update({
+                owner,
+                repo: repoName,
+                issue_number: issueNumber,
+                body
+            });
+            
+            this.logger.info(`Successfully updated issue #${issueNumber} body`);
+            return this.formatIssueData(response.data, repo);
+        } catch (error) {
+            this.logger.error(`Error updating issue #${issueNumber} body:`, error);
+            throw error;
+        }
+    }
+
+    /**
      * Format issue body with bug description and steps to reproduce
      * @param {Object} bug - Notion bug data
      * @returns {string} Formatted issue body
      */
-    formatIssueBody(bug) {
+    formatIssueBody(bug, branchUrl = null) {
         let body = '';
         
         if (bug.description) {
@@ -276,6 +306,12 @@ class GitHubClient {
         
         if (bug.stepsToReproduce) {
             body += `## Steps to Reproduce\n${bug.stepsToReproduce}\n\n`;
+        }
+
+        // Add branch information if provided
+        if (branchUrl) {
+            const branchName = branchUrl.split('/').pop();
+            body += `## Development\n**Branch:** [${branchName}](${branchUrl})\n\n`;
         }
         
         body += `---\n*This issue was automatically created from Notion bug ${bug.id}*`;

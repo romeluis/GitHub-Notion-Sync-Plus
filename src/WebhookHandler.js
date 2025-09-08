@@ -22,11 +22,12 @@ class WebhookHandler {
      * Setup Express middleware
      */
     setupMiddleware() {
-        // Enable CORS for webhook endpoint
+        // Enable CORS for webhook endpoint - allow all origins for development
         this.app.use(cors({
-            origin: ['https://notion.so', 'https://www.notion.so'],
-            methods: ['POST', 'GET'],
-            allowedHeaders: ['Content-Type', 'Authorization']
+            origin: true,
+            methods: ['POST', 'GET', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization'],
+            credentials: true
         }));
 
         // Parse JSON bodies
@@ -115,7 +116,9 @@ class WebhookHandler {
                 method: req.method,
                 url: req.url,
                 bodyType: typeof req.body,
-                bodyKeys: req.body ? Object.keys(req.body) : []
+                bodyKeys: req.body ? Object.keys(req.body) : [],
+                // Log the actual properties structure
+                fullProperties: req.body?.data?.properties ? JSON.stringify(req.body.data.properties, null, 2) : 'No properties'
             });
 
             // Validate request has body
@@ -127,15 +130,34 @@ class WebhookHandler {
                 });
             }
 
-            // Respond immediately to prevent timeout (Notion expects quick response)
-            res.status(200).json({ 
-                status: 'received', 
-                timestamp: new Date().toISOString(),
-                message: 'Webhook received and will be processed asynchronously'
-            });
-
-            // Process webhook asynchronously to avoid blocking
-            setImmediate(() => this.processWebhookAsync(req.body, req.headers));
+            // Process webhook synchronously to return proper error responses
+            try {
+                const result = await this.processWebhook(req.body, req.headers);
+                
+                if (result.success) {
+                    res.status(200).json({ 
+                        status: 'success', 
+                        timestamp: new Date().toISOString(),
+                        message: result.message,
+                        branchUrl: result.branchUrl
+                    });
+                } else {
+                    res.status(400).json({ 
+                        status: 'error', 
+                        timestamp: new Date().toISOString(),
+                        error: result.error,
+                        message: result.message
+                    });
+                }
+            } catch (error) {
+                this.logger.error('Error processing webhook:', error);
+                res.status(500).json({ 
+                    status: 'error',
+                    error: 'Webhook processing failed',
+                    message: error.message,
+                    timestamp: new Date().toISOString()
+                });
+            }
 
         } catch (error) {
             this.logger.error('Error handling webhook:', error);
@@ -152,32 +174,55 @@ class WebhookHandler {
     }
 
     /**
-     * Process webhook data asynchronously
+     * Process webhook data synchronously with error handling
      * @param {Object} webhookData - Notion webhook action data
      * @param {Object} headers - Request headers
+     * @returns {Object} Result object with success/error status
      */
-    async processWebhookAsync(webhookData, headers = {}) {
+    async processWebhook(webhookData, headers = {}) {
         try {
-            this.logger.info('Processing webhook action asynchronously', { 
+            this.logger.info('Processing webhook action', { 
                 webhookData,
                 userAgent: headers['user-agent'],
                 contentType: headers['content-type']
             });
 
             // Check if this is a branch creation action
-            if (this.isBranchCreationAction(webhookData)) {
-                this.logger.info('Webhook identified as branch creation action');
-                await this.createBranchFromWebhook(webhookData);
-            } else {
+            if (!this.isBranchCreationAction(webhookData)) {
+                const availableFields = Object.keys(webhookData || {});
                 this.logger.info('Webhook action not related to branch creation', {
                     reason: 'Missing required fields (title, id, or module)',
-                    availableFields: Object.keys(webhookData || {})
+                    availableFields
                 });
+                return {
+                    success: false,
+                    error: 'INVALID_WEBHOOK',
+                    message: `Webhook does not contain required fields for branch creation. Available fields: ${availableFields.join(', ')}`
+                };
             }
 
+            this.logger.info('Webhook identified as branch creation action');
+            return await this.createBranchFromWebhook(webhookData);
+
         } catch (error) {
-            this.logger.error('Error processing webhook asynchronously:', error);
-            // Consider adding retry logic or dead letter queue here
+            this.logger.error('Error processing webhook:', error);
+            return {
+                success: false,
+                error: 'PROCESSING_ERROR',
+                message: `Failed to process webhook: ${error.message}`
+            };
+        }
+    }
+
+    /**
+     * Process webhook data asynchronously (deprecated - kept for backward compatibility)
+     * @param {Object} webhookData - Notion webhook action data
+     * @param {Object} headers - Request headers
+     */
+    async processWebhookAsync(webhookData, headers = {}) {
+        const result = await this.processWebhook(webhookData, headers);
+        if (!result.success) {
+            this.logger.error('Async webhook processing failed:', result);
         }
     }
 
@@ -187,42 +232,43 @@ class WebhookHandler {
      * @returns {boolean} True if this is a branch creation action
      */
     isBranchCreationAction(webhookData) {
-        // Notion webhook actions send database page properties
-        // We need to look for properties that indicate a bug/task record
-        // Common properties might include: Title, ID, Module, Type, Status, etc.
+        // Notion webhook data structure: { source: {...}, data: { properties: {...} } }
+        const pageData = webhookData.data;
         
         this.logger.info('Analyzing webhook payload structure', { 
             keys: Object.keys(webhookData || {}),
-            payload: webhookData 
+            dataKeys: pageData ? Object.keys(pageData) : [],
+            properties: pageData?.properties || null,
+            availableProperties: pageData?.properties ? Object.keys(pageData.properties) : []
         });
 
-        // Check for common Notion database properties
-        if (webhookData && typeof webhookData === 'object') {
-            // Look for title property (common in Notion databases)
-            const hasTitle = webhookData.Title || webhookData.title || webhookData.Name || webhookData.name;
-            // Look for ID property (like CBUG-1 or TSK-1)
-            const hasId = webhookData.ID || webhookData.id || webhookData['Bug ID'] || webhookData['Task ID'];
-            // Look for module/type properties
-            const hasModule = webhookData.Module || webhookData.module || webhookData.Component;
-            
-            this.logger.info('Webhook property analysis', {
-                hasTitle: !!hasTitle,
-                hasId: !!hasId,
-                hasModule: !!hasModule,
-                titleValue: hasTitle,
-                idValue: hasId,
-                moduleValue: hasModule
-            });
-
-            return !!(hasTitle && (hasId || hasModule));
+        if (!pageData || !pageData.properties) {
+            this.logger.info('No page data or properties found in webhook');
+            return false;
         }
 
-        return false;
+        // Use the proper extraction methods
+        const title = this.extractTitle(webhookData);
+        const id = this.extractId(webhookData);
+        const module = this.extractModule(webhookData);
+        
+        this.logger.info('Webhook property analysis', {
+            hasTitle: !!title,
+            hasId: !!id,
+            hasModule: !!module,
+            titleValue: title,
+            idValue: id,
+            moduleValue: module,
+            availableProperties: Object.keys(pageData.properties)
+        });
+
+        return !!(title && id);
     }
 
     /**
      * Create a branch based on webhook data
      * @param {Object} webhookData - Contains database properties from Notion
+     * @returns {Object} Result object with success/error status
      */
     async createBranchFromWebhook(webhookData) {
         try {
@@ -231,23 +277,36 @@ class WebhookHandler {
             const id = this.extractId(webhookData);
             const module = this.extractModule(webhookData);
             const type = this.extractType(webhookData);
+            const pageId = this.extractPageId(webhookData);
             
             this.logger.info('Creating branch from webhook data', {
-                id, title, module, type, rawData: webhookData
+                id, title, module, type, pageId, rawData: webhookData
             });
 
             if (!title || !id) {
-                this.logger.error('Missing required data for branch creation', { 
-                    title, id, module, type 
-                });
-                return;
+                return {
+                    success: false,
+                    error: 'MISSING_REQUIRED_FIELDS',
+                    message: `Missing required fields - Title: ${title}, ID: ${id}`
+                };
+            }
+
+            if (!pageId) {
+                return {
+                    success: false,
+                    error: 'MISSING_PAGE_ID',
+                    message: 'Cannot update Notion without page ID'
+                };
             }
 
             // Get repository from module mapping
             const repository = this.getRepositoryFromModule(module);
             if (!repository) {
-                this.logger.error('Unknown module, cannot create branch', { module });
-                return;
+                return {
+                    success: false,
+                    error: 'UNKNOWN_MODULE',
+                    message: `Unknown module: ${module}. Cannot determine target repository.`
+                };
             }
 
             // Generate branch name using same format as issues: [type]/ID-title
@@ -256,83 +315,166 @@ class WebhookHandler {
             // Create branch from main
             const branchResult = await this.github.createBranch(repository, branchName, 'main');
             
-            if (branchResult) {
-                this.logger.info('Successfully created branch', {
-                    repository,
-                    branchName,
-                    branchUrl: branchResult.url
-                });
-
-                // Update Notion with branch link
-                await this.updateNotionWithBranchLink(id, branchResult.url, webhookData);
-                
-            } else {
-                this.logger.warn('Branch already exists or creation failed', {
-                    repository, branchName
-                });
+            if (!branchResult) {
+                return {
+                    success: false,
+                    error: 'BRANCH_EXISTS',
+                    message: `Branch ${branchName} already exists in ${repository}`
+                };
             }
+
+            this.logger.info('Successfully created branch', {
+                repository,
+                branchName,
+                branchUrl: branchResult.url
+            });
+
+            // Update Notion with branch link
+            const notionUpdatePromise = this.updateNotionWithBranchLink(pageId, branchResult.url, id);
+            
+            // Try to update the corresponding GitHub issue with branch link (if it exists)
+            const githubUpdatePromise = this.updateGitHubIssueWithBranchLink(id, repository, branchResult.url, branchResult.name);
+
+            const [notionResult, githubResult] = await Promise.allSettled([
+                notionUpdatePromise,
+                githubUpdatePromise
+            ]);
+
+            let message = `Successfully created branch ${branchName}`;
+            let warnings = [];
+
+            // Check Notion update result
+            if (notionResult.status === 'rejected') {
+                this.logger.error('Failed to update Notion with branch link:', notionResult.reason);
+                warnings.push(`Notion update failed: ${notionResult.reason.message}`);
+            } else {
+                message += ' and updated Notion';
+            }
+
+            // Check GitHub issue update result
+            if (githubResult.status === 'rejected') {
+                this.logger.warn('Failed to update GitHub issue with branch link:', githubResult.reason);
+                if (githubResult.reason.message !== 'ISSUE_NOT_FOUND') {
+                    warnings.push(`GitHub issue update failed: ${githubResult.reason.message}`);
+                } else {
+                    this.logger.info(`GitHub issue for ${id} doesn't exist yet - will be updated during next sync cycle`);
+                }
+            } else {
+                message += ' and GitHub issue';
+            }
+
+            return {
+                success: true,
+                message: message,
+                branchUrl: branchResult.url,
+                branchName,
+                repository,
+                warnings: warnings.length > 0 ? warnings : undefined
+            };
 
         } catch (error) {
             this.logger.error('Error creating branch from webhook:', error);
+            return {
+                success: false,
+                error: 'BRANCH_CREATION_FAILED',
+                message: `Failed to create branch: ${error.message}`
+            };
         }
     }
 
     /**
-     * Extract title from webhook data
+     * Extract page ID from webhook data
+     * @param {Object} webhookData - Webhook payload  
+     * @returns {string|null} Notion page ID
+     */
+    extractPageId(webhookData) {
+        // Page ID is in data.id
+        return webhookData.data?.id || null;
+    }
+
+    /**
+     * Extract title from webhook data (Notion format)
      * @param {Object} webhookData - Webhook payload
      * @returns {string|null} Title value
      */
     extractTitle(webhookData) {
-        return webhookData.Title || 
-               webhookData.title || 
-               webhookData.Name || 
-               webhookData.name || 
-               webhookData['Bug Title'] ||
-               webhookData['Task Title'] ||
-               null;
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        // Try different title field names
+        const titleProp = properties['Bug Title'] || properties['Task Title'] || properties['Title'] || properties['Name'];
+        
+        if (titleProp && titleProp.title && Array.isArray(titleProp.title)) {
+            // Notion title is an array of text objects
+            return titleProp.title.map(t => t.plain_text).join('').trim();
+        }
+        
+        return null;
     }
 
     /**
-     * Extract ID from webhook data
+     * Extract ID from webhook data (Notion format)
      * @param {Object} webhookData - Webhook payload
-     * @returns {string|null} ID value
+     * @returns {string|null} ID value (e.g., "CBUG-2")
      */
     extractId(webhookData) {
-        return webhookData.ID || 
-               webhookData.id || 
-               webhookData['Bug ID'] || 
-               webhookData['Task ID'] ||
-               webhookData.Number ||
-               webhookData.number ||
-               null;
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        // Try different ID field names
+        const idProp = properties['ID'] || properties['Bug ID'] || properties['Task ID'];
+        
+        if (idProp && idProp.unique_id) {
+            // Notion unique_id format: {prefix: "CBUG", number: 2} -> "CBUG-2"
+            return `${idProp.unique_id.prefix}-${idProp.unique_id.number}`;
+        }
+        
+        // Fallback for other ID formats
+        if (idProp && idProp.rich_text && Array.isArray(idProp.rich_text)) {
+            return idProp.rich_text.map(t => t.plain_text).join('').trim();
+        }
+        
+        return null;
     }
 
     /**
-     * Extract module from webhook data
+     * Extract module from webhook data (Notion format)
      * @param {Object} webhookData - Webhook payload
      * @returns {string|null} Module value
      */
     extractModule(webhookData) {
-        return webhookData.Module || 
-               webhookData.module || 
-               webhookData.Component || 
-               webhookData.component ||
-               webhookData.Area ||
-               webhookData.area ||
-               'Application'; // Default fallback
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        // Try different module field names  
+        const moduleProp = properties['Module'] || properties['Component'] || properties['Area'];
+        
+        if (moduleProp && moduleProp.select) {
+            // Notion select format: {select: {name: "Application"}}
+            return moduleProp.select.name;
+        }
+        
+        return 'Application'; // Default fallback
     }
 
     /**
-     * Extract type from webhook data
+     * Extract type from webhook data (Notion format)
      * @param {Object} webhookData - Webhook payload
      * @returns {string|null} Type value
      */
     extractType(webhookData) {
-        return webhookData.Type || 
-               webhookData.type || 
-               webhookData.Category || 
-               webhookData.category ||
-               'feature'; // Default fallback
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        // Try different type field names
+        const typeProp = properties['Type'] || properties['Category'];
+        
+        if (typeProp && typeProp.select) {
+            // Notion select format: {select: {name: "Cosmetic"}}
+            return typeProp.select.name.toLowerCase();
+        }
+        
+        return 'feature'; // Default fallback
     }
 
     /**
@@ -343,16 +485,70 @@ class WebhookHandler {
      * @returns {string} Branch name
      */
     generateBranchName(id, title, type) {
-        // Convert title to safe branch name
-        const safeTitle = title
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, '') // Remove special characters
-            .replace(/\s+/g, '-')         // Replace spaces with hyphens
-            .substring(0, 40);            // Limit length
+        // Clean the title for branch name (remove special characters, limit length)
+        const cleanTitle = title
+            .trim()
+            .replace(/[^a-zA-Z0-9\s-]/g, '') // Remove special characters except spaces and hyphens
+            .replace(/\s+/g, ' ')            // Normalize spaces
+            .substring(0, 50);               // Limit length
 
-        // Format: feature/CBUG-1-fix-login-issue
-        const prefix = id.startsWith('TSK-') ? 'task' : 'feature';
-        return `${prefix}/${id}-${safeTitle}`;
+        // Format: ID/type-title → CBUG-2/cosmetic-test-bug-fix
+        return `${id}/${type.toLowerCase()}-${cleanTitle.toLowerCase().replace(/\s+/g, '-')}`;
+    }
+
+    /**
+     * Extract description from webhook data
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} Description value
+     */
+    extractDescription(webhookData) {
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        // Try different description field names
+        const descProp = properties['Description'] || properties['Details'] || properties['Notes'];
+        
+        if (descProp && descProp.rich_text && descProp.rich_text.length > 0) {
+            return descProp.rich_text.map(text => text.plain_text).join('');
+        }
+        
+        return null;
+    }
+
+    /**
+     * Extract priority from webhook data
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} Priority value
+     */
+    extractPriority(webhookData) {
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        const priorityProp = properties['Priority'];
+        
+        if (priorityProp && priorityProp.select) {
+            return priorityProp.select.name;
+        }
+        
+        return null;
+    }
+
+    /**
+     * Extract assignee from webhook data
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} Assignee value
+     */
+    extractAssignee(webhookData) {
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        const assigneeProp = properties['Assignee'] || properties['Assigned To'];
+        
+        if (assigneeProp && assigneeProp.people && assigneeProp.people.length > 0) {
+            return assigneeProp.people[0].name;
+        }
+        
+        return null;
     }
 
     /**
@@ -362,33 +558,222 @@ class WebhookHandler {
      */
     getRepositoryFromModule(module) {
         try {
-            const moduleMapping = JSON.parse(this.config.get('MODULE_MAPPING'));
-            return moduleMapping[module] || null;
+            return this.config.getRepositoryForModule(module);
         } catch (error) {
-            this.logger.error('Error parsing module mapping:', error);
+            this.logger.error('Error getting repository for module:', error);
             return null;
         }
     }
 
     /**
      * Update Notion with branch link
-     * @param {string} id - Bug/Task ID
+     * @param {string} pageId - Notion page ID
      * @param {string} branchUrl - GitHub branch URL
-     * @param {Object} webhookData - Original webhook data for context
+     * @param {string} id - Bug/Task ID for logging
      */
-    async updateNotionWithBranchLink(id, branchUrl, webhookData) {
+    async updateNotionWithBranchLink(pageId, branchUrl, id) {
         try {
-            // This would need to be implemented based on whether it's a Bug or Task
-            // For now, we'll log the action
-            this.logger.info('Would update Notion with branch link', {
-                id, branchUrl, type: id.startsWith('TSK-') ? 'Task' : 'Bug'
-            });
+            this.logger.info('Updating Notion with branch link', { pageId, branchUrl, id });
 
-            // TODO: Implement Notion API call to update branch link field
-            // This would require knowing the page ID from the webhook or finding it by ID
+            // Determine if this is a Bug or Task based on ID format
+            const isTask = id.startsWith('TSK-');
+            const isBug = id.startsWith('CBUG-') || id.startsWith('BUG-');
+
+            if (isBug) {
+                // Use existing NotionClient method for bugs
+                await this.notion.updateBugProperties(pageId, {
+                    branchUrl: branchUrl
+                });
+            } else if (isTask) {
+                // For tasks, we need to update the Task database directly
+                await this.updateTaskBranchLink(pageId, branchUrl);
+            } else {
+                // Generic update for other types
+                await this.updatePageBranchLink(pageId, branchUrl);
+            }
+
+            this.logger.info('Successfully updated Notion with branch link', { pageId, id, branchUrl });
 
         } catch (error) {
             this.logger.error('Error updating Notion with branch link:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update Task database with branch link
+     * @param {string} pageId - Notion page ID
+     * @param {string} branchUrl - GitHub branch URL
+     */
+    async updateTaskBranchLink(pageId, branchUrl) {
+        try {
+            const response = await this.notion.notion.pages.update({
+                page_id: pageId,
+                properties: {
+                    'Branch Link': {
+                        url: branchUrl
+                    }
+                }
+            });
+            return response;
+        } catch (error) {
+            this.logger.error('Error updating task branch link:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update GitHub issue with branch link information
+     * @param {string} bugId - Bug ID (e.g., "CBUG-2")
+     * @param {string} repository - Repository name (e.g., "owner/repo")
+     * @param {string} branchUrl - GitHub branch URL
+     * @param {string} branchName - Branch name
+     * @returns {Promise<Object>} Update result
+     */
+    async updateGitHubIssueWithBranchLink(bugId, repository, branchUrl, branchName) {
+        try {
+            this.logger.info('Searching for GitHub issue with bug ID:', { bugId, repository });
+
+            // Find the GitHub issue corresponding to this bug
+            const issue = await this.findGitHubIssueByBugId(bugId, repository);
+            
+            if (!issue) {
+                this.logger.info(`No GitHub issue found for bug ${bugId} in ${repository} - issue may not be created yet`);
+                const error = new Error('ISSUE_NOT_FOUND');
+                error.message = 'ISSUE_NOT_FOUND';
+                throw error;
+            }
+
+            this.logger.info(`Found GitHub issue #${issue.number} for bug ${bugId}`);
+
+            // Update the issue body to include branch information in the Development section
+            await this.updateGitHubIssueBody(repository, issue.number, issue.body, branchUrl, branchName);
+
+            this.logger.info(`Successfully updated GitHub issue #${issue.number} Development section with branch information`);
+            
+            return {
+                success: true,
+                issueNumber: issue.number,
+                branchUrl,
+                branchName
+            };
+
+        } catch (error) {
+            if (error.message === 'ISSUE_NOT_FOUND') {
+                throw error; // Re-throw as-is for caller to handle
+            }
+            this.logger.error('Error updating GitHub issue with branch link:', error);
+            throw new Error(`Failed to update GitHub issue: ${error.message}`);
+        }
+    }
+
+    /**
+     * Find a GitHub issue by bug ID
+     * @param {string} bugId - Bug ID (e.g., "CBUG-2")
+     * @param {string} repository - Repository name (e.g., "owner/repo")
+     * @returns {Promise<Object|null>} GitHub issue object or null if not found
+     */
+    async findGitHubIssueByBugId(bugId, repository) {
+        try {
+            // Fetch all synced issues from the repository
+            const issues = await this.github.fetchSyncedIssues(repository);
+            
+            // Find the issue that matches the bug ID in the title
+            const matchingIssue = issues.find(issue => {
+                // Use DataMapper to extract bug ID from title
+                const extractedId = this.extractBugIdFromIssueTitle(issue.title);
+                return extractedId === bugId;
+            });
+
+            return matchingIssue || null;
+
+        } catch (error) {
+            this.logger.error(`Error finding GitHub issue for bug ${bugId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Extract bug ID from GitHub issue title
+     * @param {string} title - GitHub issue title
+     * @returns {string|null} Extracted bug ID or null
+     */
+    extractBugIdFromIssueTitle(title) {
+        // Match formats: 
+        // New format: "[Bug]/CBUG-2 Test Title" or "[Cosmetic]/CBUG-2 Test Title"
+        // Alternative: "CBUG-2: Test Title"
+        
+        const newFormatMatch = title.match(/^\[.*?\]\/(CBUG-\d+|TSK-\d+)\s+(.+)$/);
+        if (newFormatMatch) {
+            return newFormatMatch[1]; // Return CBUG-2 or TSK-1
+        }
+
+        const alternativeMatch = title.match(/^(CBUG-\d+|TSK-\d+):\s+(.+)$/);
+        if (alternativeMatch) {
+            return alternativeMatch[1]; // Return CBUG-2 or TSK-1
+        }
+        
+        return null;
+    }
+
+    /**
+     * Update GitHub issue body to include branch information
+     * @param {string} repository - Repository name
+     * @param {number} issueNumber - GitHub issue number
+     * @param {string} currentBody - Current issue body
+     * @param {string} branchUrl - GitHub branch URL
+     * @param {string} branchName - Branch name
+     */
+    async updateGitHubIssueBody(repository, issueNumber, currentBody, branchUrl, branchName) {
+        try {
+            let newBody = currentBody || '';
+            
+            // Check if Development section already exists
+            if (newBody.includes('## Development')) {
+                // Check if this branch is already in the Development section
+                if (newBody.includes(branchUrl)) {
+                    this.logger.info(`Branch ${branchName} already exists in issue #${issueNumber} Development section`);
+                    return;
+                }
+                
+                // Update existing Development section
+                const developmentRegex = /(## Development\n)(.*?)(\n\n|$)/s;
+                const developmentMatch = newBody.match(developmentRegex);
+                
+                if (developmentMatch) {
+                    const existingContent = developmentMatch[2].trim();
+                    const newContent = existingContent 
+                        ? `${existingContent}\n**Branch:** [${branchName}](${branchUrl})`
+                        : `**Branch:** [${branchName}](${branchUrl})`;
+                    
+                    newBody = newBody.replace(
+                        developmentRegex,
+                        `## Development\n${newContent}\n\n`
+                    );
+                }
+            } else {
+                // Add new Development section
+                const developmentSection = `## Development\n**Branch:** [${branchName}](${branchUrl})`;
+                
+                if (newBody.includes('---\n*This issue was automatically created from Notion')) {
+                    // Insert before the footer
+                    newBody = newBody.replace(
+                        /---\n\*This issue was automatically created from Notion/,
+                        `${developmentSection}\n\n---\n*This issue was automatically created from Notion`
+                    );
+                } else {
+                    // Just append
+                    newBody += `\n\n${developmentSection}`;
+                }
+            }
+
+            await this.github.updateIssueBody(repository, issueNumber, newBody);
+
+            this.logger.info(`Updated issue #${issueNumber} Development section with branch: ${branchName}`);
+
+        } catch (error) {
+            this.logger.error(`Error updating issue body for #${issueNumber}:`, error);
+            // Don't throw here as this is not critical - the main branch creation succeeded
         }
     }
 

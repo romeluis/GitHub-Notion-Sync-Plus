@@ -152,6 +152,16 @@ class SyncManager {
                         'Notion bug missing or has incorrect GitHub issue link'
                     ));
                 }
+
+                // Check if GitHub issue needs branch link update
+                if (bug.branchUrl && !this.issueHasBranchLink(correspondingIssue, bug.branchUrl)) {
+                    operations.push(this.mapper.createSyncOperation(
+                        'update_github_branch',
+                        bug,
+                        correspondingIssue,
+                        'GitHub issue missing branch link from Notion'
+                    ));
+                }
             }
         }
 
@@ -280,6 +290,19 @@ class SyncManager {
     }
 
     /**
+     * Check if a GitHub issue has a specific branch link in its body
+     * @param {Object} issue - GitHub issue object
+     * @param {string} branchUrl - Branch URL to check for
+     * @returns {boolean} True if issue has the branch link
+     */
+    issueHasBranchLink(issue, branchUrl) {
+        if (!issue.body || !branchUrl) return false;
+        
+        // Check if the branch URL appears in the issue body
+        return issue.body.includes(branchUrl);
+    }
+
+    /**
      * Execute a single sync operation
      * @param {Object} operation - Sync operation object
      * @returns {Object} Operation result
@@ -300,6 +323,9 @@ class SyncManager {
             case 'update_notion_link':
                 return await this.updateNotionBugLink(operation.source, operation.target);
 
+            case 'update_github_branch':
+                return await this.updateGitHubIssueBranchLink(operation.source, operation.target);
+
             case 'delete':
                 return await this.deleteGitHubIssue(operation.target);
 
@@ -318,8 +344,8 @@ class SyncManager {
         
         this.logger.info(`Creating GitHub issue for bug ${bug.id} in ${repository}`);
         
-        // Create the GitHub issue
-        const issue = await this.github.createIssue(repository, bug);
+        // Create the GitHub issue with branch URL if available
+        const issue = await this.github.createIssue(repository, bug, bug.branchUrl);
         
         // Update the Notion bug with the GitHub issue link
         try {
@@ -330,7 +356,8 @@ class SyncManager {
             // Don't fail the entire operation if we can't update the link
         }
         
-        this.logger.info(`Successfully created issue #${issue.githubId} for bug ${bug.id}`);
+        this.logger.info(`Successfully created issue #${issue.githubId} for bug ${bug.id}` + 
+                        (bug.branchUrl ? ` with branch link: ${bug.branchUrl}` : ''));
         return issue;
     }
 
@@ -385,6 +412,72 @@ class SyncManager {
         const updatedBug = await this.notion.updateBugIssueLink(bug.notionId, issue.githubUrl);
         
         return updatedBug;
+    }
+
+    /**
+     * Update GitHub issue with branch link from Notion
+     * @param {Object} bug - Notion bug object with branch URL
+     * @param {Object} issue - GitHub issue object
+     * @returns {Object} Updated issue
+     */
+    async updateGitHubIssueBranchLink(bug, issue) {
+        this.logger.info(`Updating GitHub issue #${issue.githubId} with branch link: ${bug.branchUrl}`);
+        
+        try {
+            const branchName = bug.branchUrl.split('/').pop();
+            
+            // Update the issue body to include branch information in Development section
+            let newBody = issue.body || '';
+            
+            // Check if Development section already exists
+            if (newBody.includes('## Development')) {
+                // Update existing Development section
+                const developmentRegex = /(## Development\n)(.*?)(\n\n|$)/s;
+                const developmentMatch = newBody.match(developmentRegex);
+                
+                if (developmentMatch && !developmentMatch[2].includes(bug.branchUrl)) {
+                    // Add branch to existing Development section
+                    const existingContent = developmentMatch[2].trim();
+                    const newContent = existingContent 
+                        ? `${existingContent}\n**Branch:** [${branchName}](${bug.branchUrl})`
+                        : `**Branch:** [${branchName}](${bug.branchUrl})`;
+                    
+                    newBody = newBody.replace(
+                        developmentRegex,
+                        `## Development\n${newContent}\n\n`
+                    );
+                }
+            } else {
+                // Add new Development section
+                const developmentSection = `## Development\n**Branch:** [${branchName}](${bug.branchUrl})`;
+                
+                if (newBody.includes('---\n*This issue was automatically created from Notion')) {
+                    // Insert before the footer
+                    newBody = newBody.replace(
+                        /---\n\*This issue was automatically created from Notion/,
+                        `${developmentSection}\n\n---\n*This issue was automatically created from Notion`
+                    );
+                } else {
+                    // Just append
+                    newBody += `\n\n${developmentSection}`;
+                }
+            }
+
+            await this.github.updateIssueBody(issue.repository, issue.githubId, newBody);
+
+            this.logger.info(`Successfully updated GitHub issue #${issue.githubId} Development section with branch link`);
+            
+            return {
+                type: 'updated',
+                issueNumber: issue.githubId,
+                branchUrl: bug.branchUrl,
+                branchName: branchName
+            };
+
+        } catch (error) {
+            this.logger.error(`Failed to update GitHub issue #${issue.githubId} with branch link:`, error);
+            throw error;
+        }
     }
 
     /**

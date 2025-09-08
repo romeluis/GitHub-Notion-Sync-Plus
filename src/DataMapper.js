@@ -123,8 +123,15 @@ class DataMapper {
      * @returns {string|null} Extracted bug ID or null
      */
     extractBugIdFromTitle(title) {
-        const match = title.match(/^\[(\w+)\]\/(CBUG-\d+)\s+(.+)$/);
-        return match ? match[2] : null;
+        // Match new format: "CBUG-2: Test Title" or old format: "[Application]/(CBUG-2) Title"
+        const newMatch = title.match(/^(CBUG-\d+|TSK-\d+):\s+(.+)$/);
+        if (newMatch) {
+            return newMatch[1]; // Return CBUG-2 or TSK-1
+        }
+        
+        // Fallback to old format
+        const oldMatch = title.match(/^\[(\w+)\]\/(CBUG-\d+)\s+(.+)$/);
+        return oldMatch ? oldMatch[2] : null;
     }
 
     /**
