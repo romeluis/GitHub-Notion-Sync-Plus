@@ -461,6 +461,329 @@ class GitHubClient {
             throw error;
         }
     }
+
+    /**
+     * Fetch pull requests for a specific branch or all PRs related to synced issues
+     * @param {string} repo - Repository in format "owner/repo"
+     * @param {string} branchName - Optional branch name to filter PRs
+     * @returns {Array} Array of formatted pull request objects
+     */
+    async fetchPullRequests(repo, branchName = null) {
+        try {
+            const [owner, repoName] = repo.split('/');
+            this.logger.info(`Fetching pull requests from ${repo}${branchName ? ` for branch ${branchName}` : ''}...`);
+            
+            const params = {
+                owner,
+                repo: repoName,
+                state: 'all',
+                per_page: 100
+            };
+
+            if (branchName) {
+                params.head = `${owner}:${branchName}`;
+            }
+            
+            const response = await this.octokit.rest.pulls.list(params);
+            const prs = response.data.map(pr => this.formatPullRequestData(pr, repo));
+            
+            this.logger.info(`Successfully fetched ${prs.length} pull requests from ${repo}`);
+            return prs;
+        } catch (error) {
+            if (error.status === 404) {
+                this.logger.warn(`Repository ${repo} not found or no access`);
+                return [];
+            }
+            this.logger.error(`Error fetching pull requests from ${repo}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Fetch all pull requests from multiple repositories
+     * @param {Array} repos - Array of repository names
+     * @returns {Array} Array of all pull requests from all repositories
+     */
+    async fetchAllPullRequests(repos) {
+        try {
+            this.logger.info(`Fetching pull requests from ${repos.length} repositories...`);
+            
+            const allPRs = [];
+            for (const repo of repos) {
+                try {
+                    const prs = await this.fetchPullRequests(repo);
+                    allPRs.push(...prs);
+                } catch (error) {
+                    this.logger.warn(`Skipping ${repo} due to error:`, error.message);
+                    // Continue with other repositories
+                }
+            }
+            
+            this.logger.info(`Successfully fetched ${allPRs.length} total pull requests`);
+            return allPRs;
+        } catch (error) {
+            this.logger.error('Error fetching all pull requests:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Format raw GitHub pull request data into structured object
+     * @param {Object} pr - Raw GitHub pull request object
+     * @param {string} repo - Repository name
+     * @returns {Object} Formatted pull request object
+     */
+    formatPullRequestData(pr, repo) {
+        // Extract bug/task ID from branch name if possible
+        const branchName = pr.head.ref;
+        const bugIdMatch = branchName.match(/^(CBUG-\d+|TSK-\d+)\//);
+        
+        return {
+            githubId: pr.number,
+            githubUrl: pr.html_url,
+            repository: repo,
+            title: pr.title,
+            body: pr.body,
+            state: pr.state, // 'open' or 'closed'
+            merged: pr.merged || false, // GitHub API provides this field
+            mergeable: pr.mergeable, // null, true, or false
+            mergeable_state: pr.mergeable_state, // Additional merge state info
+            branchName: branchName,
+            baseBranch: pr.base.ref,
+            headBranch: pr.head.ref,
+            createdAt: pr.created_at,
+            updatedAt: pr.updated_at,
+            mergedAt: pr.merged_at,
+            closedAt: pr.closed_at,
+            // Extract bug/task ID from branch name
+            bugId: bugIdMatch ? bugIdMatch[1] : null,
+            // Check if PR is associated with a synced issue
+            labels: pr.labels ? pr.labels.map(label => label.name) : []
+        };
+    }
+
+    /**
+     * Find pull requests associated with a specific bug/task ID
+     * @param {string} bugId - Bug/Task ID (e.g., "CBUG-2" or "TSK-1")
+     * @param {string} repo - Repository name
+     * @returns {Array} Array of pull requests associated with the bug/task
+     */
+    async findPullRequestsByBugId(bugId, repo) {
+        try {
+            const allPRs = await this.fetchPullRequests(repo);
+            
+            // Filter PRs that are related to this bug ID
+            const relatedPRs = allPRs.filter(pr => {
+                // Check if PR branch name starts with bug ID
+                return pr.branchName.startsWith(`${bugId}/`) || pr.bugId === bugId;
+            });
+            
+            this.logger.info(`Found ${relatedPRs.length} pull requests for bug ${bugId} in ${repo}`);
+            return relatedPRs;
+        } catch (error) {
+            this.logger.error(`Error finding pull requests for bug ${bugId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Get the most relevant pull request for a bug/task
+     * @param {string} bugId - Bug/Task ID
+     * @param {string} repo - Repository name
+     * @returns {Object|null} Most relevant pull request or null
+     */
+    async getMostRelevantPullRequest(bugId, repo) {
+        const prs = await this.findPullRequestsByBugId(bugId, repo);
+        
+        if (prs.length === 0) {
+            return null;
+        }
+        
+        // Sort by priority: open PRs first, then merged, then closed
+        // Within each group, sort by most recent
+        prs.sort((a, b) => {
+            // Priority order: open > merged > closed
+            const getStatePriority = (pr) => {
+                if (pr.state === 'open') return 3;
+                if (pr.merged) return 2;
+                return 1; // closed but not merged
+            };
+            
+            const priorityDiff = getStatePriority(b) - getStatePriority(a);
+            if (priorityDiff !== 0) return priorityDiff;
+            
+            // If same priority, sort by most recent update
+            return new Date(b.updatedAt) - new Date(a.updatedAt);
+        });
+        
+        return prs[0];
+    }
+
+    /**
+     * Check if a branch exists in a repository
+     * @param {string} repo - Repository name (owner/repo)
+     * @param {string} branchName - Branch name to check
+     * @returns {boolean} True if branch exists
+     */
+    async checkBranchExists(repo, branchName) {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            await this.octokit.rest.git.getRef({
+                owner,
+                repo: repoName,
+                ref: `heads/${branchName}`
+            });
+            
+            this.logger.info(`Branch ${branchName} exists in ${repo}`);
+            return true;
+        } catch (error) {
+            if (error.status === 404) {
+                this.logger.info(`Branch ${branchName} does not exist in ${repo}`);
+                return false;
+            }
+            this.logger.error(`Error checking if branch ${branchName} exists:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Check if a branch has changes compared to another branch
+     * @param {string} repo - Repository name (owner/repo)
+     * @param {string} branchName - Branch to check
+     * @param {string} baseBranch - Base branch to compare against (default: main)
+     * @returns {boolean} True if branch has changes
+     */
+    async branchHasChanges(repo, branchName, baseBranch = 'main') {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            const comparison = await this.octokit.rest.repos.compareCommitsWithBasehead({
+                owner,
+                repo: repoName,
+                basehead: `${baseBranch}...${branchName}`
+            });
+            
+            const hasChanges = comparison.data.ahead_by > 0;
+            this.logger.info(`Branch ${branchName} has ${comparison.data.ahead_by} commits ahead of ${baseBranch}`);
+            return hasChanges;
+        } catch (error) {
+            this.logger.error(`Error comparing branch ${branchName} with ${baseBranch}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Create a new pull request
+     * @param {string} repo - Repository name (owner/repo)
+     * @param {string} headBranch - Source branch for the PR
+     * @param {string} baseBranch - Target branch for the PR (default: main)
+     * @param {string} title - PR title
+     * @param {string} body - PR body/description
+     * @returns {Object} Created pull request object
+     */
+    async createPullRequest(repo, headBranch, baseBranch, title, body) {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            this.logger.info(`Creating pull request in ${repo}: ${headBranch} → ${baseBranch}`);
+            this.logger.info(`PR Title: ${title}`);
+            
+            const response = await this.octokit.rest.pulls.create({
+                owner,
+                repo: repoName,
+                title,
+                body,
+                head: headBranch,
+                base: baseBranch
+            });
+            
+            this.logger.info(`Successfully created PR #${response.data.number} in ${repo}`);
+            return this.formatPullRequestData(response.data, repo);
+        } catch (error) {
+            this.logger.error(`Error creating pull request in ${repo}:`, error);
+            
+            if (error.status === 422) {
+                // Handle common PR creation errors
+                if (error.message?.includes('No commits between')) {
+                    throw new Error(`No changes found between ${baseBranch} and ${headBranch}`);
+                } else if (error.message?.includes('already exists')) {
+                    throw new Error(`Pull request already exists for branch ${headBranch}`);
+                }
+            }
+            
+            throw error;
+        }
+    }
+
+    /**
+     * Get detailed pull request information
+     * @param {string} repo - Repository name (owner/repo)
+     * @param {number} prNumber - Pull request number
+     * @returns {Object} Detailed pull request data
+     */
+    async getPullRequestDetails(repo, prNumber) {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            const response = await this.octokit.rest.pulls.get({
+                owner,
+                repo: repoName,
+                pull_number: prNumber
+            });
+            
+            this.logger.info(`Retrieved details for PR #${prNumber} in ${repo}`);
+            return response.data;
+        } catch (error) {
+            this.logger.error(`Error getting PR #${prNumber} details:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Merge a pull request
+     * @param {string} repo - Repository name (owner/repo)
+     * @param {number} prNumber - Pull request number
+     * @param {string} commitTitle - Commit title for the merge
+     * @param {string} mergeMethod - Merge method: 'merge', 'squash', or 'rebase'
+     * @returns {Object} Merge result
+     */
+    async mergePullRequest(repo, prNumber, commitTitle, mergeMethod = 'squash') {
+        try {
+            const [owner, repoName] = repo.split('/');
+            
+            this.logger.info(`Merging PR #${prNumber} in ${repo} using ${mergeMethod} method`);
+            
+            const response = await this.octokit.rest.pulls.merge({
+                owner,
+                repo: repoName,
+                pull_number: prNumber,
+                commit_title: commitTitle,
+                merge_method: mergeMethod
+            });
+            
+            this.logger.info(`Successfully merged PR #${prNumber}`, {
+                sha: response.data.sha,
+                merged: response.data.merged
+            });
+            
+            return {
+                merged: response.data.merged,
+                sha: response.data.sha,
+                message: response.data.message
+            };
+        } catch (error) {
+            this.logger.error(`Error merging PR #${prNumber}:`, error);
+            
+            if (error.status === 405) {
+                throw new Error(`Pull request #${prNumber} cannot be merged: ${error.message}`);
+            } else if (error.status === 409) {
+                throw new Error(`Merge conflict in pull request #${prNumber}: ${error.message}`);
+            }
+            
+            throw error;
+        }
+    }
 }
 
 module.exports = GitHubClient;

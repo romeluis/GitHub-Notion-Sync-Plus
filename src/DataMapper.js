@@ -166,6 +166,14 @@ class DataMapper {
     validateBugForSync(bug) {
         const errors = [];
         
+        // Skip validation for tasks - they don't need GitHub issues
+        if (bug.itemType === 'task') {
+            return {
+                isValid: false,
+                errors: ['Tasks are not synced to GitHub issues - they only sync PR properties']
+            };
+        }
+        
         if (!bug.id) {
             errors.push('Bug ID is missing');
         }
@@ -201,6 +209,81 @@ class DataMapper {
             action,
             source,
             target,
+            reason,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    /**
+     * Map GitHub pull request state to Notion PR status
+     * @param {Object} pr - GitHub pull request object
+     * @returns {string} Notion PR status
+     */
+    mapGitHubPRStateToNotionStatus(pr) {
+        if (!pr) {
+            return 'None';
+        }
+        
+        if (pr.state === 'open') {
+            // Check for merge conflicts or issues that prevent merging
+            if (pr.mergeable === false) {
+                return 'Merge Issue';
+            }
+            return 'Open';
+        } else if (pr.state === 'closed') {
+            // Distinguish between merged and just closed
+            // Check multiple indicators for merged state
+            if (pr.merged === true || pr.mergedAt || pr.merged_at) {
+                return 'Merged';
+            } else {
+                // PR was closed without merging (cancelled, rejected, etc.)
+                return 'Closed';
+            }
+        }
+        
+        // Default fallback
+        return 'Open';
+    }
+
+    /**
+     * Determine if PR status needs to be updated in Notion
+     * @param {string} currentNotionStatus - Current PR status in Notion
+     * @param {Object} githubPR - GitHub pull request object
+     * @returns {boolean} True if update is needed
+     */
+    needsPRStatusUpdate(currentNotionStatus, githubPR) {
+        const expectedStatus = this.mapGitHubPRStateToNotionStatus(githubPR);
+        return currentNotionStatus !== expectedStatus;
+    }
+
+    /**
+     * Determine if PR link needs to be updated in Notion
+     * @param {string} currentNotionLink - Current PR link in Notion
+     * @param {Object} githubPR - GitHub pull request object
+     * @returns {boolean} True if update is needed
+     */
+    needsPRLinkUpdate(currentNotionLink, githubPR) {
+        if (!githubPR) {
+            // If no PR exists but Notion has a link, don't clear it
+            // The link might point to a PR in a different repo or be manually set
+            return false;
+        }
+        
+        return currentNotionLink !== githubPR.githubUrl;
+    }
+
+    /**
+     * Create PR sync operation for updating Notion with GitHub PR data
+     * @param {Object} bug - Notion bug object
+     * @param {Object} pr - GitHub pull request object
+     * @param {string} reason - Reason for the sync
+     * @returns {Object} Sync operation object
+     */
+    createPRSyncOperation(bug, pr, reason) {
+        return {
+            action: 'update_notion_pr',
+            source: bug,
+            target: pr,
             reason,
             timestamp: new Date().toISOString()
         };

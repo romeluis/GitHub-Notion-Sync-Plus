@@ -2,11 +2,12 @@ const { Client } = require('@notionhq/client');
 const Logger = require('./Logger');
 
 class NotionClient {
-    constructor(token, databaseId) {
+    constructor(token, bugDatabaseId, taskDatabaseId = null) {
         this.notion = new Client({
             auth: token,
         });
-        this.databaseId = databaseId;
+        this.bugDatabaseId = bugDatabaseId;
+        this.taskDatabaseId = taskDatabaseId;
         this.logger = new Logger('NotionClient');
     }
 
@@ -19,7 +20,7 @@ class NotionClient {
             this.logger.info('Fetching all bugs from Notion database...');
             
             const response = await this.notion.databases.query({
-                database_id: this.databaseId,
+                database_id: this.bugDatabaseId,
                 sorts: [
                     {
                         property: 'ID',
@@ -36,6 +37,52 @@ class NotionClient {
             this.logger.error('Error fetching bugs from Notion:', error);
             throw error;
         }
+    }
+
+    /**
+     * Fetch all tasks from the Notion database (if configured)
+     * @returns {Array} Array of formatted task objects
+     */
+    async fetchAllTasks() {
+        if (!this.taskDatabaseId) {
+            this.logger.info('Tasks database not configured, returning empty array');
+            return [];
+        }
+
+        try {
+            this.logger.info('Fetching all tasks from Notion database...');
+            
+            const response = await this.notion.databases.query({
+                database_id: this.taskDatabaseId,
+                sorts: [
+                    {
+                        property: 'ID',
+                        direction: 'ascending',
+                    },
+                ],
+            });
+
+            const tasks = response.results.map(page => this.formatTaskData(page));
+            
+            this.logger.info(`Successfully fetched ${tasks.length} tasks from Notion`);
+            return tasks;
+        } catch (error) {
+            this.logger.error('Error fetching tasks from Notion:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Fetch all bugs and tasks combined
+     * @returns {Object} Object with bugs and tasks arrays
+     */
+    async fetchAllItems() {
+        const [bugs, tasks] = await Promise.all([
+            this.fetchAllBugs(),
+            this.fetchAllTasks()
+        ]);
+
+        return { bugs, tasks };
     }
 
     /**
@@ -57,8 +104,38 @@ class NotionClient {
             module: this.extractSelectFromProperty(properties.Module),
             issueLink: this.extractUrlFromProperty(properties['Issue Link']),
             branchUrl: this.extractUrlFromProperty(properties['Branch Link']),
+            pullRequestStatus: this.extractStatusFromProperty(properties['Pull Request Status']),
+            pullRequestLink: this.extractUrlFromProperty(properties['Pull Request Link']),
             lastModified: page.last_edited_time,
-            url: page.url
+            url: page.url,
+            itemType: 'bug'
+        };
+    }
+
+    /**
+     * Format raw Notion page data into structured task object
+     * @param {Object} page - Raw Notion page object
+     * @returns {Object} Formatted task object
+     */
+    formatTaskData(page) {
+        const properties = page.properties;
+        
+        return {
+            notionId: page.id,
+            id: this.extractIdFromProperty(properties.ID),
+            title: this.extractTextFromProperty(properties['Task Title'] || properties['Title']),
+            status: this.extractStatusFromProperty(properties.Status),
+            type: this.extractSelectFromProperty(properties.Type),
+            description: this.extractTextFromProperty(properties.Description),
+            stepsToReproduce: this.extractTextFromProperty(properties['Acceptance Criteria'] || properties['Requirements']),
+            module: this.extractSelectFromProperty(properties.Module),
+            issueLink: this.extractUrlFromProperty(properties['Issue Link']),
+            branchUrl: this.extractUrlFromProperty(properties['Branch Link']),
+            pullRequestStatus: this.extractStatusFromProperty(properties['Pull Request Status']),
+            pullRequestLink: this.extractUrlFromProperty(properties['Pull Request Link']),
+            lastModified: page.last_edited_time,
+            url: page.url,
+            itemType: 'task'
         };
     }
 
@@ -188,11 +265,176 @@ class NotionClient {
     }
 
     /**
-     * Update both status and issue link in a single call
+     * Update bug pull request status in Notion
      * @param {string} pageId - Notion page ID
-     * @param {Object} updates - Updates object with status and/or issueUrl
+     * @param {string} prStatus - PR status (None, Merge Issue, Open, Merged, Closed)
      * @returns {Object} Updated page object
      */
+    async updateBugPullRequestStatus(pageId, prStatus) {
+        try {
+            this.logger.info(`Updating bug ${pageId} PR status to: ${prStatus}`);
+            
+            const response = await this.notion.pages.update({
+                page_id: pageId,
+                properties: {
+                    'Pull Request Status': {
+                        status: {
+                            name: prStatus
+                        }
+                    }
+                }
+            });
+            
+            this.logger.info(`Successfully updated bug ${pageId} PR status`);
+            return response;
+        } catch (error) {
+            this.logger.error(`Error updating bug PR status for ${pageId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update bug pull request link in Notion
+     * @param {string} pageId - Notion page ID
+     * @param {string} prUrl - GitHub pull request URL
+     * @returns {Object} Updated page object
+     */
+    async updateBugPullRequestLink(pageId, prUrl) {
+        try {
+            this.logger.info(`Updating bug ${pageId} PR link to: ${prUrl}`);
+            
+            const response = await this.notion.pages.update({
+                page_id: pageId,
+                properties: {
+                    'Pull Request Link': {
+                        url: prUrl
+                    }
+                }
+            });
+            
+            this.logger.info(`Successfully updated bug ${pageId} PR link`);
+            return response;
+        } catch (error) {
+            this.logger.error(`Error updating bug PR link for ${pageId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update task status in Notion
+     * @param {string} pageId - Notion page ID
+     * @param {string} status - New status value
+     * @returns {Object} Updated page object
+     */
+    async updateTaskStatus(pageId, status) {
+        try {
+            this.logger.info(`Updating task ${pageId} status to: ${status}`);
+            
+            const response = await this.notion.pages.update({
+                page_id: pageId,
+                properties: {
+                    'Status': {
+                        status: {
+                            name: status
+                        }
+                    }
+                }
+            });
+            
+            this.logger.info(`Successfully updated task ${pageId} status`);
+            return response;
+        } catch (error) {
+            this.logger.error(`Error updating task status for ${pageId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update task issue link in Notion
+     * @param {string} pageId - Notion page ID
+     * @param {string} issueUrl - GitHub issue URL
+     * @returns {Object} Updated page object
+     */
+    async updateTaskIssueLink(pageId, issueUrl) {
+        try {
+            this.logger.info(`Updating task ${pageId} issue link to: ${issueUrl}`);
+            
+            const response = await this.notion.pages.update({
+                page_id: pageId,
+                properties: {
+                    'Issue Link': {
+                        url: issueUrl
+                    }
+                }
+            });
+            
+            this.logger.info(`Successfully updated task ${pageId} issue link`);
+            return response;
+        } catch (error) {
+            this.logger.error(`Error updating task issue link for ${pageId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update task properties (can handle both bugs and tasks)
+     * @param {string} pageId - Notion page ID
+     * @param {Object} updates - Updates object
+     * @param {string} itemType - 'bug' or 'task' (for logging)
+     * @returns {Object} Updated page object
+     */
+    async updateTaskProperties(pageId, updates, itemType = 'task') {
+        try {
+            this.logger.info(`Updating ${itemType} ${pageId} properties:`, Object.keys(updates));
+            
+            const properties = {};
+            
+            if (updates.status) {
+                properties['Status'] = {
+                    status: {
+                        name: updates.status
+                    }
+                };
+            }
+            
+            if (updates.issueUrl) {
+                properties['Issue Link'] = {
+                    url: updates.issueUrl
+                };
+            }
+
+            if (updates.branchUrl) {
+                properties['Branch Link'] = {
+                    url: updates.branchUrl
+                };
+            }
+
+            if (updates.pullRequestStatus) {
+                properties['Pull Request Status'] = {
+                    status: {
+                        name: updates.pullRequestStatus
+                    }
+                };
+            }
+
+            if (updates.pullRequestLink) {
+                properties['Pull Request Link'] = {
+                    url: updates.pullRequestLink
+                };
+            }
+            
+            const response = await this.notion.pages.update({
+                page_id: pageId,
+                properties
+            });
+            
+            this.logger.info(`Successfully updated ${itemType} ${pageId} properties`);
+            return response;
+        } catch (error) {
+            this.logger.error(`Error updating ${itemType} properties for ${pageId}:`, error);
+            throw error;
+        }
+    }
     async updateBugProperties(pageId, updates) {
         try {
             this.logger.info(`Updating bug ${pageId} properties:`, Object.keys(updates));
@@ -216,6 +458,20 @@ class NotionClient {
             if (updates.branchUrl) {
                 properties['Branch Link'] = {
                     url: updates.branchUrl
+                };
+            }
+
+            if (updates.pullRequestStatus) {
+                properties['Pull Request Status'] = {
+                    status: {
+                        name: updates.pullRequestStatus
+                    }
+                };
+            }
+
+            if (updates.pullRequestLink) {
+                properties['Pull Request Link'] = {
+                    url: updates.pullRequestLink
                 };
             }
             

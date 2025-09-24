@@ -26,6 +26,13 @@ class ConfigManager {
             throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
         }
 
+        // Check for optional Tasks database
+        if (process.env.TASK_DATABASE_ID) {
+            this.logger.info('Tasks database configuration found');
+        } else {
+            this.logger.warn('TASK_DATABASE_ID not configured - Tasks table sync disabled');
+        }
+
         this.logger.info('All required environment variables are present');
     }
 
@@ -51,6 +58,22 @@ class ConfigManager {
      */
     getBugDatabaseId() {
         return process.env.BUG_DATABASE_ID;
+    }
+
+    /**
+     * Get Task database ID
+     * @returns {string|null} Database ID or null if not configured
+     */
+    getTaskDatabaseId() {
+        return process.env.TASK_DATABASE_ID || null;
+    }
+
+    /**
+     * Check if Tasks table is configured
+     * @returns {boolean} True if Tasks table is configured
+     */
+    hasTasksDatabase() {
+        return !!process.env.TASK_DATABASE_ID;
     }
 
     /**

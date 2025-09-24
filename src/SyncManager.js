@@ -36,18 +36,22 @@ class SyncManager {
         
         try {
             // Step 1: Fetch data from both sources
-            const [notionBugs, githubIssues] = await Promise.all([
-                this.notion.fetchAllBugs(),
-                this.github.fetchAllSyncedIssues(this.config.getAllRepositories())
+            const [notionData, githubIssues, githubPRs] = await Promise.all([
+                this.notion.fetchAllItems(), // This returns {bugs, tasks}
+                this.github.fetchAllSyncedIssues(this.config.getAllRepositories()),
+                this.github.fetchAllPullRequests(this.config.getAllRepositories())
             ]);
 
-            this.logger.info(`Found ${notionBugs.length} bugs in Notion, ${githubIssues.length} synced issues in GitHub`);
+            // Combine bugs and tasks into a single items array for unified processing
+            const allItems = [...notionData.bugs, ...notionData.tasks];
+
+            this.logger.info(`Found ${notionData.bugs.length} bugs and ${notionData.tasks.length} tasks in Notion, ${githubIssues.length} synced issues in GitHub, ${githubPRs.length} pull requests in GitHub`);
 
             // Step 2: Create mappings for efficient lookup
-            const { bugMap, issueMap } = this.createMappings(notionBugs, githubIssues);
+            const { bugMap, issueMap, prMap } = this.createMappings(allItems, githubIssues, githubPRs);
 
-            // Step 3: Determine sync operations
-            const syncOperations = this.determineSyncOperations(bugMap, issueMap);
+            // Step 3: Determine sync operations (including PR sync)
+            const syncOperations = this.determineSyncOperations(bugMap, issueMap, prMap);
 
             // Step 4: Execute sync operations
             const results = await this.executeSyncOperations(syncOperations);
@@ -77,19 +81,21 @@ class SyncManager {
     }
 
     /**
-     * Create mappings for efficient bug/issue lookups
-     * @param {Array} bugs - Array of Notion bugs
+     * Create mappings for efficient bug/issue/PR lookups
+     * @param {Array} items - Array of Notion bugs and tasks
      * @param {Array} issues - Array of GitHub issues
-     * @returns {Object} Maps for bugs and issues
+     * @param {Array} prs - Array of GitHub pull requests
+     * @returns {Object} Maps for bugs, issues, and PRs
      */
-    createMappings(bugs, issues) {
+    createMappings(items, issues, prs = []) {
         const bugMap = new Map();
         const issueMap = new Map();
+        const prMap = new Map();
 
-        // Create bug mapping by ID
-        bugs.forEach(bug => {
-            if (bug.id) {
-                bugMap.set(bug.id, bug);
+        // Create item mapping by ID (works for both bugs and tasks)
+        items.forEach(item => {
+            if (item.id) {
+                bugMap.set(item.id, item);
             }
         });
 
@@ -101,84 +107,202 @@ class SyncManager {
             }
         });
 
-        this.logger.debug(`Created mappings: ${bugMap.size} bugs, ${issueMap.size} issues`);
-        return { bugMap, issueMap };
+        // Create PR mapping by bug ID (extracted from branch name)
+        prs.forEach(pr => {
+            if (pr.bugId) {
+                // Store as array since there could be multiple PRs for one bug
+                if (!prMap.has(pr.bugId)) {
+                    prMap.set(pr.bugId, []);
+                }
+                prMap.get(pr.bugId).push(pr);
+            }
+        });
+
+        this.logger.debug(`Created mappings: ${bugMap.size} items, ${issueMap.size} issues, ${prMap.size} PR groups`);
+        return { bugMap, issueMap, prMap };
     }
 
     /**
      * Determine what sync operations need to be performed
-     * @param {Map} bugMap - Map of Notion bugs by ID
+     * @param {Map} bugMap - Map of Notion items (bugs & tasks) by ID
      * @param {Map} issueMap - Map of GitHub issues by bug ID
+     * @param {Map} prMap - Map of GitHub pull requests by bug ID
      * @returns {Array} Array of sync operations
      */
-    determineSyncOperations(bugMap, issueMap) {
+    determineSyncOperations(bugMap, issueMap, prMap = new Map()) {
         const operations = [];
 
-        // Check each bug in Notion
-        for (const [bugId, bug] of bugMap) {
-            const validation = this.mapper.validateBugForSync(bug);
+        // Check each item in Notion (bugs and tasks)
+        for (const [itemId, item] of bugMap) {
+            // Tasks only sync PR properties, not GitHub issues
+            if (item.itemType === 'task') {
+                // Only check for PR sync operations for tasks
+                const correspondingPRs = prMap.get(itemId) || [];
+                const prSyncOperations = this.determinePRSyncOperations(item, correspondingPRs);
+                operations.push(...prSyncOperations);
+                continue; // Skip all other sync operations for tasks
+            }
+
+            // For bugs, proceed with full validation and sync
+            const validation = this.mapper.validateBugForSync(item);
             if (!validation.isValid) {
-                this.logger.warn(`Skipping invalid bug ${bugId}:`, validation.errors);
+                this.logger.warn(`Skipping invalid ${item.itemType || 'item'} ${itemId}:`, validation.errors);
                 continue;
             }
 
-            const correspondingIssue = issueMap.get(bugId);
+            const correspondingIssue = issueMap.get(itemId);
+            const correspondingPRs = prMap.get(itemId) || [];
 
             if (!correspondingIssue) {
-                // Bug exists in Notion but not in GitHub
-                // Check if bug already has an issue link (might be broken link)
-                if (bug.issueLink) {
-                    this.logger.warn(`Bug ${bugId} has issue link but no corresponding GitHub issue found. Link: ${bug.issueLink}`);
+                // Item exists in Notion but not in GitHub
+                // Check if item already has an issue link (might be broken link)
+                if (item.issueLink) {
+                    this.logger.warn(`${item.itemType || 'Item'} ${itemId} has issue link but no corresponding GitHub issue found. Link: ${item.issueLink}`);
                     // Still create operation - the existing link might be broken
                 }
                 
                 operations.push(this.mapper.createSyncOperation(
                     'create',
-                    bug,
+                    item,
                     null,
-                    'Bug exists in Notion but not in GitHub'
+                    `${item.itemType || 'Item'} exists in Notion but not in GitHub`
                 ));
             } else {
-                // Bug exists in both - CHECK FOR UPDATES
-                const updateOperations = this.determineUpdateOperations(bug, correspondingIssue);
+                // Item exists in both - CHECK FOR UPDATES
+                const updateOperations = this.determineUpdateOperations(item, correspondingIssue);
                 operations.push(...updateOperations);
                 
-                // Also check if Notion bug is missing the issue link
-                if (!bug.issueLink || bug.issueLink !== correspondingIssue.githubUrl) {
+                // Also check if Notion item is missing the issue link
+                if (!item.issueLink || item.issueLink !== correspondingIssue.githubUrl) {
                     operations.push(this.mapper.createSyncOperation(
                         'update_notion_link',
-                        bug,
+                        item,
                         correspondingIssue,
-                        'Notion bug missing or has incorrect GitHub issue link'
+                        `Notion ${item.itemType || 'item'} missing or has incorrect GitHub issue link`
                     ));
                 }
 
                 // Check if GitHub issue needs branch link update
-                if (bug.branchUrl && !this.issueHasBranchLink(correspondingIssue, bug.branchUrl)) {
+                if (item.branchUrl && !this.issueHasBranchLink(correspondingIssue, item.branchUrl)) {
                     operations.push(this.mapper.createSyncOperation(
                         'update_github_branch',
-                        bug,
+                        item,
                         correspondingIssue,
                         'GitHub issue missing branch link from Notion'
                     ));
                 }
             }
+
+            // Check for PR sync operations
+            const prSyncOperations = this.determinePRSyncOperations(item, correspondingPRs);
+            operations.push(...prSyncOperations);
         }
 
         // Check for orphaned issues (exist in GitHub but not in Notion)
-        for (const [bugId, issue] of issueMap) {
-            if (!bugMap.has(bugId)) {
+        for (const [itemId, issue] of issueMap) {
+            if (!bugMap.has(itemId)) {
                 operations.push(this.mapper.createSyncOperation(
                     'delete',
                     null,
                     issue,
-                    'Issue exists in GitHub but corresponding bug was deleted from Notion'
+                    'Issue exists in GitHub but corresponding item was deleted from Notion'
                 ));
             }
         }
 
         this.logger.info(`Determined ${operations.length} sync operations`);
         return operations;
+    }
+
+    /**
+     * Determine PR sync operations for an item (bug or task)
+     * @param {Object} item - Notion item object (bug or task)
+     * @param {Array} prs - Array of GitHub pull requests for this item
+     * @returns {Array} Array of PR sync operations
+     */
+    determinePRSyncOperations(item, prs) {
+        const operations = [];
+
+        // Get the most relevant PR for this item
+        const mostRelevantPR = this.getMostRelevantPR(prs);
+
+        // Check if PR status needs to be updated
+        if (mostRelevantPR) {
+            const expectedPRStatus = this.mapper.mapGitHubPRStateToNotionStatus(mostRelevantPR);
+            this.logger.debug(`PR analysis for ${item.itemType || 'item'} ${item.id}:`);
+            this.logger.debug(`  Current Notion status: "${item.pullRequestStatus}"`);
+            this.logger.debug(`  Expected status: "${expectedPRStatus}"`);
+            this.logger.debug(`  PR state: "${mostRelevantPR.state}"`);
+            this.logger.debug(`  PR merged: "${mostRelevantPR.merged}"`);
+            this.logger.debug(`  PR merged_at: "${mostRelevantPR.mergedAt}"`);
+            this.logger.debug(`  PR closed_at: "${mostRelevantPR.closedAt}"`);
+            this.logger.debug(`  PR mergeable: "${mostRelevantPR.mergeable}"`);
+            
+            if (this.mapper.needsPRStatusUpdate(item.pullRequestStatus, mostRelevantPR)) {
+                operations.push(this.mapper.createPRSyncOperation(
+                    item,
+                    mostRelevantPR,
+                    `PR status should be "${expectedPRStatus}" but is "${item.pullRequestStatus}"`
+                ));
+            }
+
+            // Check if PR link needs to be updated
+            if (this.mapper.needsPRLinkUpdate(item.pullRequestLink, mostRelevantPR)) {
+                operations.push(this.mapper.createSyncOperation(
+                    'update_notion_pr_link',
+                    item,
+                    mostRelevantPR,
+                    `PR link should be "${mostRelevantPR.githubUrl}" but is "${item.pullRequestLink}"`
+                ));
+            }
+        } else {
+            // No PR found - check if we should clear PR status/link
+            if (item.pullRequestStatus && item.pullRequestStatus !== 'None') {
+                // Only clear if there's a branch URL but no PR - indicating development started but no PR created yet
+                if (item.branchUrl) {
+                    this.logger.debug(`${item.itemType || 'Item'} ${item.id} has branch but no PR - keeping current PR status`);
+                } else {
+                    operations.push(this.mapper.createSyncOperation(
+                        'clear_notion_pr',
+                        item,
+                        null,
+                        `No pull request found for ${item.itemType || 'item'}, clearing PR status`
+                    ));
+                }
+            }
+        }
+
+        return operations;
+    }
+
+    /**
+     * Get the most relevant pull request from an array of PRs
+     * @param {Array} prs - Array of pull requests
+     * @returns {Object|null} Most relevant PR or null
+     */
+    getMostRelevantPR(prs) {
+        if (!prs || prs.length === 0) {
+            return null;
+        }
+
+        // Sort by priority: open PRs first, then merged, then closed
+        // Within each group, sort by most recent
+        const sortedPRs = [...prs].sort((a, b) => {
+            // Priority order: open > merged > closed
+            const getStatePriority = (pr) => {
+                if (pr.state === 'open') return 3;
+                if (pr.merged) return 2;
+                return 1; // closed but not merged
+            };
+            
+            const priorityDiff = getStatePriority(b) - getStatePriority(a);
+            if (priorityDiff !== 0) return priorityDiff;
+            
+            // If same priority, sort by most recent update
+            return new Date(b.updatedAt) - new Date(a.updatedAt);
+        });
+
+        return sortedPRs[0];
     }
 
     /**
@@ -271,6 +395,9 @@ class SyncManager {
                         break;
                     case 'update_github_state':
                     case 'update_notion_status':
+                    case 'update_notion_pr':
+                    case 'update_notion_pr_link':
+                    case 'clear_notion_pr':
                         results.updated++;
                         break;
                     case 'delete':
@@ -329,6 +456,15 @@ class SyncManager {
             case 'delete':
                 return await this.deleteGitHubIssue(operation.target);
 
+            case 'update_notion_pr':
+                return await this.updateNotionPRProperties(operation.source, operation.target);
+
+            case 'update_notion_pr_link':
+                return await this.updateNotionPRLink(operation.source, operation.target);
+
+            case 'clear_notion_pr':
+                return await this.clearNotionPRProperties(operation.source);
+
             default:
                 throw new Error(`Unknown operation: ${operation.action}`);
         }
@@ -385,33 +521,43 @@ class SyncManager {
     }
 
     /**
-     * Update Notion bug status based on GitHub issue state
-     * @param {Object} bug - Notion bug object
+     * Update Notion item status based on GitHub issue state
+     * @param {Object} item - Notion item object (bug or task)
      * @param {Object} issue - GitHub issue object
-     * @returns {Object} Updated bug
+     * @returns {Object} Updated item
      */
-    async updateNotionBugStatus(bug, issue) {
-        const newStatus = this.mapper.mapGitHubStateToNotionStatus(issue.state, bug.status);
+    async updateNotionBugStatus(item, issue) {
+        const newStatus = this.mapper.mapGitHubStateToNotionStatus(issue.state, item.status);
         
-        this.logger.info(`Updating Notion bug ${bug.id} status to: ${newStatus}`);
+        this.logger.info(`Updating Notion ${item.itemType || 'item'} ${item.id} status to: ${newStatus}`);
         
-        const updatedBug = await this.notion.updateBugStatus(bug.notionId, newStatus);
+        let updatedItem;
+        if (item.itemType === 'task') {
+            updatedItem = await this.notion.updateTaskStatus(item.notionId, newStatus);
+        } else {
+            updatedItem = await this.notion.updateBugStatus(item.notionId, newStatus);
+        }
         
-        return updatedBug;
+        return updatedItem;
     }
 
     /**
-     * Update Notion bug issue link
-     * @param {Object} bug - Notion bug object
+     * Update Notion item issue link
+     * @param {Object} item - Notion item object (bug or task)
      * @param {Object} issue - GitHub issue object
-     * @returns {Object} Updated bug
+     * @returns {Object} Updated item
      */
-    async updateNotionBugLink(bug, issue) {
-        this.logger.info(`Updating Notion bug ${bug.id} issue link to: ${issue.githubUrl}`);
+    async updateNotionBugLink(item, issue) {
+        this.logger.info(`Updating Notion ${item.itemType || 'item'} ${item.id} issue link to: ${issue.githubUrl}`);
         
-        const updatedBug = await this.notion.updateBugIssueLink(bug.notionId, issue.githubUrl);
+        let updatedItem;
+        if (item.itemType === 'task') {
+            updatedItem = await this.notion.updateTaskIssueLink(item.notionId, issue.githubUrl);
+        } else {
+            updatedItem = await this.notion.updateBugIssueLink(item.notionId, issue.githubUrl);
+        }
         
-        return updatedBug;
+        return updatedItem;
     }
 
     /**
@@ -517,6 +663,96 @@ class SyncManager {
                 success: false,
                 error: error.message
             };
+        }
+    }
+
+    /**
+     * Update Notion item PR properties based on GitHub PR data
+     * @param {Object} item - Notion item object (bug or task)
+     * @param {Object} pr - GitHub pull request object
+     * @returns {Object} Updated item
+     */
+    async updateNotionPRProperties(item, pr) {
+        try {
+            const prStatus = this.mapper.mapGitHubPRStateToNotionStatus(pr);
+            
+            this.logger.info(`Updating Notion ${item.itemType || 'item'} ${item.id} PR properties - Status: ${prStatus}, Link: ${pr.githubUrl}`);
+            
+            let updatedItem;
+            if (item.itemType === 'task') {
+                updatedItem = await this.notion.updateTaskProperties(item.notionId, {
+                    pullRequestStatus: prStatus,
+                    pullRequestLink: pr.githubUrl
+                }, 'task');
+            } else {
+                updatedItem = await this.notion.updateBugProperties(item.notionId, {
+                    pullRequestStatus: prStatus,
+                    pullRequestLink: pr.githubUrl
+                });
+            }
+            
+            this.logger.info(`Successfully updated PR properties for ${item.itemType || 'item'} ${item.id}`);
+            return updatedItem;
+        } catch (error) {
+            this.logger.error(`Failed to update PR properties for ${item.itemType || 'item'} ${item.id}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update Notion item PR link only
+     * @param {Object} item - Notion item object (bug or task)
+     * @param {Object} pr - GitHub pull request object
+     * @returns {Object} Updated item
+     */
+    async updateNotionPRLink(item, pr) {
+        try {
+            this.logger.info(`Updating Notion ${item.itemType || 'item'} ${item.id} PR link to: ${pr.githubUrl}`);
+            
+            let updatedItem;
+            if (item.itemType === 'task') {
+                updatedItem = await this.notion.updateTaskProperties(item.notionId, {
+                    pullRequestLink: pr.githubUrl
+                }, 'task');
+            } else {
+                updatedItem = await this.notion.updateBugPullRequestLink(item.notionId, pr.githubUrl);
+            }
+            
+            this.logger.info(`Successfully updated PR link for ${item.itemType || 'item'} ${item.id}`);
+            return updatedItem;
+        } catch (error) {
+            this.logger.error(`Failed to update PR link for ${item.itemType || 'item'} ${item.id}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Clear Notion item PR properties (set status to None, clear link)
+     * @param {Object} item - Notion item object (bug or task)
+     * @returns {Object} Updated item
+     */
+    async clearNotionPRProperties(item) {
+        try {
+            this.logger.info(`Clearing PR properties for Notion ${item.itemType || 'item'} ${item.id}`);
+            
+            let updatedItem;
+            if (item.itemType === 'task') {
+                updatedItem = await this.notion.updateTaskProperties(item.notionId, {
+                    pullRequestStatus: 'None',
+                    pullRequestLink: null
+                }, 'task');
+            } else {
+                updatedItem = await this.notion.updateBugProperties(item.notionId, {
+                    pullRequestStatus: 'None',
+                    pullRequestLink: null
+                });
+            }
+            
+            this.logger.info(`Successfully cleared PR properties for ${item.itemType || 'item'} ${item.id}`);
+            return updatedItem;
+        } catch (error) {
+            this.logger.error(`Failed to clear PR properties for ${item.itemType || 'item'} ${item.id}:`, error);
+            throw error;
         }
     }
 }

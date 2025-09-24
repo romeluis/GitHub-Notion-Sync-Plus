@@ -188,21 +188,32 @@ class WebhookHandler {
             });
 
             // Check if this is a branch creation action
-            if (!this.isBranchCreationAction(webhookData)) {
+            if (!this.isBranchCreationAction(webhookData) && !this.isPullRequestCreationAction(webhookData) && !this.isMergeChangesAction(webhookData)) {
                 const availableFields = Object.keys(webhookData || {});
-                this.logger.info('Webhook action not related to branch creation', {
-                    reason: 'Missing required fields (title, id, or module)',
+                this.logger.info('Webhook action not recognized', {
+                    reason: 'Missing required fields',
                     availableFields
                 });
                 return {
                     success: false,
                     error: 'INVALID_WEBHOOK',
-                    message: `Webhook does not contain required fields for branch creation. Available fields: ${availableFields.join(', ')}`
+                    message: `Webhook does not contain required fields for any supported action. Available fields: ${availableFields.join(', ')}`
                 };
             }
 
-            this.logger.info('Webhook identified as branch creation action');
-            return await this.createBranchFromWebhook(webhookData);
+            // Determine which action to take based on priority
+            // Note: This is a simplified detection - in practice, you might want to add
+            // a specific field or parameter to distinguish between PR creation and merge
+            if (this.isMergeChangesAction(webhookData)) {
+                this.logger.info('Webhook identified as merge changes action');
+                return await this.mergeChangesFromWebhook(webhookData);
+            } else if (this.isPullRequestCreationAction(webhookData)) {
+                this.logger.info('Webhook identified as pull request creation action');
+                return await this.createPullRequestFromWebhook(webhookData);
+            } else {
+                this.logger.info('Webhook identified as branch creation action');
+                return await this.createBranchFromWebhook(webhookData);
+            }
 
         } catch (error) {
             this.logger.error('Error processing webhook:', error);
@@ -263,6 +274,66 @@ class WebhookHandler {
         });
 
         return !!(title && id);
+    }
+
+    /**
+     * Check if webhook action is for pull request creation
+     * @param {Object} webhookData - Webhook payload
+     * @returns {boolean} True if this is a PR creation action
+     */
+    isPullRequestCreationAction(webhookData) {
+        const pageData = webhookData.data;
+        
+        if (!pageData || !pageData.properties) {
+            this.logger.info('No page data or properties found in webhook for PR creation');
+            return false;
+        }
+
+        const title = this.extractTitle(webhookData);
+        const id = this.extractId(webhookData);
+        const branchUrl = this.extractBranchUrl(webhookData);
+        
+        this.logger.info('PR webhook property analysis', {
+            hasTitle: !!title,
+            hasId: !!id,
+            hasBranchUrl: !!branchUrl,
+            titleValue: title,
+            idValue: id,
+            branchUrlValue: branchUrl
+        });
+
+        // Need title, id, and branch URL to create PR
+        return !!(title && id && branchUrl);
+    }
+
+    /**
+     * Check if webhook action is for merging changes
+     * @param {Object} webhookData - Webhook payload
+     * @returns {boolean} True if this is a merge action
+     */
+    isMergeChangesAction(webhookData) {
+        const pageData = webhookData.data;
+        
+        if (!pageData || !pageData.properties) {
+            this.logger.info('No page data or properties found in webhook for merge action');
+            return false;
+        }
+
+        const title = this.extractTitle(webhookData);
+        const id = this.extractId(webhookData);
+        const branchUrl = this.extractBranchUrl(webhookData);
+        
+        this.logger.info('Merge webhook property analysis', {
+            hasTitle: !!title,
+            hasId: !!id,
+            hasBranchUrl: !!branchUrl,
+            titleValue: title,
+            idValue: id,
+            branchUrlValue: branchUrl
+        });
+
+        // Need title, id, and branch URL to merge changes
+        return !!(title && id && branchUrl);
     }
 
     /**
@@ -383,6 +454,275 @@ class WebhookHandler {
     }
 
     /**
+     * Create a pull request based on webhook data
+     * @param {Object} webhookData - Contains database properties from Notion
+     * @returns {Object} Result object with success/error status
+     */
+    async createPullRequestFromWebhook(webhookData) {
+        try {
+            // Extract data from webhook payload
+            const title = this.extractTitle(webhookData);
+            const id = this.extractId(webhookData);
+            const module = this.extractModule(webhookData);
+            const type = this.extractType(webhookData);
+            const pageId = this.extractPageId(webhookData);
+            const branchUrl = this.extractBranchUrl(webhookData);
+            const description = this.extractDescription(webhookData);
+            
+            this.logger.info('Creating pull request from webhook data', {
+                id, title, module, type, pageId, branchUrl, description
+            });
+
+            if (!title || !id || !branchUrl) {
+                return {
+                    success: false,
+                    error: 'MISSING_REQUIRED_FIELDS',
+                    message: `Missing required fields - Title: ${!!title}, ID: ${!!id}, Branch URL: ${!!branchUrl}`
+                };
+            }
+
+            if (!pageId) {
+                return {
+                    success: false,
+                    error: 'MISSING_PAGE_ID',
+                    message: 'Cannot update Notion without page ID'
+                };
+            }
+
+            // Parse branch URL to get repository and branch name
+            const branchInfo = this.parseBranchUrl(branchUrl);
+            if (!branchInfo) {
+                return {
+                    success: false,
+                    error: 'INVALID_BRANCH_URL',
+                    message: `Could not parse branch URL: ${branchUrl}`
+                };
+            }
+
+            const { repository, branchName } = branchInfo;
+
+            // Check if branch exists and has changes
+            const branchStatus = await this.checkBranchStatus(repository, branchName);
+            if (!branchStatus.exists) {
+                return {
+                    success: false,
+                    error: 'BRANCH_NOT_FOUND',
+                    message: `Branch ${branchName} does not exist in ${repository}`
+                };
+            }
+
+            if (!branchStatus.hasChanges) {
+                return {
+                    success: false,
+                    error: 'NO_CHANGES',
+                    message: `Branch ${branchName} has no changes compared to main`
+                };
+            }
+
+            // Check if PR already exists for this branch
+            const existingPR = await this.findExistingPR(repository, branchName);
+            if (existingPR) {
+                return {
+                    success: false,
+                    error: 'PR_ALREADY_EXISTS',
+                    message: `Pull request already exists for branch ${branchName}: ${existingPR.githubUrl}`
+                };
+            }
+
+            // Create the pull request
+            const prTitle = this.generatePRTitle(id, title, type);
+            const prBody = this.generatePRBody(description, id, type);
+            
+            const pullRequest = await this.github.createPullRequest(
+                repository, 
+                branchName, 
+                'main', 
+                prTitle, 
+                prBody
+            );
+
+            this.logger.info('Successfully created pull request', {
+                repository,
+                branchName,
+                prNumber: pullRequest.githubId,
+                prUrl: pullRequest.githubUrl
+            });
+
+            // Update Notion with PR information
+            await this.updateNotionWithPRInfo(pageId, id, pullRequest.githubUrl, 'Open');
+
+            return {
+                success: true,
+                message: `Successfully created pull request #${pullRequest.githubId}`,
+                pullRequestUrl: pullRequest.githubUrl,
+                pullRequestNumber: pullRequest.githubId,
+                branchName,
+                repository
+            };
+
+        } catch (error) {
+            this.logger.error('Error creating pull request from webhook:', error);
+            return {
+                success: false,
+                error: 'PR_CREATION_FAILED',
+                message: `Failed to create pull request: ${error.message}`
+            };
+        }
+    }
+
+    /**
+     * Merge changes from branch - create PR if needed, then merge
+     * @param {Object} webhookData - Contains database properties from Notion
+     * @returns {Object} Result object with success/error status
+     */
+    async mergeChangesFromWebhook(webhookData) {
+        try {
+            // Extract data from webhook payload
+            const title = this.extractTitle(webhookData);
+            const id = this.extractId(webhookData);
+            const module = this.extractModule(webhookData);
+            const type = this.extractType(webhookData);
+            const pageId = this.extractPageId(webhookData);
+            const branchUrl = this.extractBranchUrl(webhookData);
+            const description = this.extractDescription(webhookData);
+            
+            this.logger.info('Merging changes from webhook data', {
+                id, title, module, type, pageId, branchUrl, description
+            });
+
+            if (!title || !id || !branchUrl) {
+                return {
+                    success: false,
+                    error: 'MISSING_REQUIRED_FIELDS',
+                    message: `Missing required fields - Title: ${!!title}, ID: ${!!id}, Branch URL: ${!!branchUrl}`
+                };
+            }
+
+            if (!pageId) {
+                return {
+                    success: false,
+                    error: 'MISSING_PAGE_ID',
+                    message: 'Cannot update Notion without page ID'
+                };
+            }
+
+            // Parse branch URL to get repository and branch name
+            const branchInfo = this.parseBranchUrl(branchUrl);
+            if (!branchInfo) {
+                return {
+                    success: false,
+                    error: 'INVALID_BRANCH_URL',
+                    message: `Could not parse branch URL: ${branchUrl}`
+                };
+            }
+
+            const { repository, branchName } = branchInfo;
+
+            // Check if branch exists and has changes
+            const branchStatus = await this.checkBranchStatus(repository, branchName);
+            if (!branchStatus.exists) {
+                return {
+                    success: false,
+                    error: 'BRANCH_NOT_FOUND',
+                    message: `Branch ${branchName} does not exist in ${repository}`
+                };
+            }
+
+            if (!branchStatus.hasChanges) {
+                return {
+                    success: false,
+                    error: 'NO_CHANGES',
+                    message: `Branch ${branchName} has no changes compared to main`
+                };
+            }
+
+            // Check if PR already exists
+            let pullRequest = await this.findExistingPR(repository, branchName);
+            
+            if (!pullRequest) {
+                // Create PR first
+                this.logger.info('No existing PR found, creating one first...');
+                
+                const prTitle = this.generatePRTitle(id, title, type);
+                const prBody = this.generatePRBody(description, id, type);
+                
+                try {
+                    pullRequest = await this.github.createPullRequest(
+                        repository, 
+                        branchName, 
+                        'main', 
+                        prTitle, 
+                        prBody
+                    );
+                    
+                    this.logger.info('Successfully created PR before merging', {
+                        prNumber: pullRequest.githubId,
+                        prUrl: pullRequest.githubUrl
+                    });
+                    
+                    // Update Notion with PR info temporarily
+                    await this.updateNotionWithPRInfo(pageId, id, pullRequest.githubUrl, 'Open');
+                    
+                } catch (error) {
+                    return {
+                        success: false,
+                        error: 'PR_CREATION_FAILED',
+                        message: `Failed to create PR before merging: ${error.message}`
+                    };
+                }
+            }
+
+            // Check if PR is mergeable
+            const mergeableStatus = await this.checkPRMergeability(repository, pullRequest.githubId);
+            if (!mergeableStatus.mergeable) {
+                return {
+                    success: false,
+                    error: 'PR_NOT_MERGEABLE',
+                    message: `Pull request #${pullRequest.githubId} is not mergeable: ${mergeableStatus.reason}`
+                };
+            }
+
+            // Merge the pull request
+            this.logger.info(`Merging pull request #${pullRequest.githubId}...`);
+            
+            const mergeResult = await this.github.mergePullRequest(
+                repository, 
+                pullRequest.githubId,
+                `Merge ${title || pullRequest.title}`,
+                'squash' // or 'merge' or 'rebase' based on your preference
+            );
+
+            this.logger.info('Successfully merged pull request', {
+                prNumber: pullRequest.githubId,
+                mergeSha: mergeResult.sha,
+                merged: mergeResult.merged
+            });
+
+            // Update Notion with merged status
+            await this.updateNotionWithPRInfo(pageId, id, pullRequest.githubUrl, 'Merged');
+
+            return {
+                success: true,
+                message: `Successfully merged pull request #${pullRequest.githubId}`,
+                pullRequestUrl: pullRequest.githubUrl,
+                pullRequestNumber: pullRequest.githubId,
+                branchName,
+                repository,
+                mergeSha: mergeResult.sha,
+                wasCreated: !pullRequest.existed // Track if we created the PR
+            };
+
+        } catch (error) {
+            this.logger.error('Error merging changes from webhook:', error);
+            return {
+                success: false,
+                error: 'MERGE_FAILED',
+                message: `Failed to merge changes: ${error.message}`
+            };
+        }
+    }
+
+    /**
      * Extract page ID from webhook data
      * @param {Object} webhookData - Webhook payload  
      * @returns {string|null} Notion page ID
@@ -475,6 +815,25 @@ class WebhookHandler {
         }
         
         return 'feature'; // Default fallback
+    }
+
+    /**
+     * Extract branch URL from webhook data (Notion format)
+     * @param {Object} webhookData - Webhook payload
+     * @returns {string|null} Branch URL value
+     */
+    extractBranchUrl(webhookData) {
+        const properties = webhookData.data?.properties;
+        if (!properties) return null;
+
+        // Try different branch URL field names
+        const branchProp = properties['Branch Link'] || properties['Branch URL'] || properties['Branch'];
+        
+        if (branchProp && branchProp.url) {
+            return branchProp.url;
+        }
+        
+        return null;
     }
 
     /**
@@ -618,6 +977,86 @@ class WebhookHandler {
             return response;
         } catch (error) {
             this.logger.error('Error updating task branch link:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Update Task database with PR properties
+     * @param {string} pageId - Notion page ID
+     * @param {Object} updates - Object containing PR status and/or link
+     */
+    async updateTaskPRProperties(pageId, updates) {
+        try {
+            const properties = {};
+            
+            if (updates.branchUrl) {
+                properties['Branch Link'] = {
+                    url: updates.branchUrl
+                };
+            }
+
+            if (updates.pullRequestStatus) {
+                properties['Pull Request Status'] = {
+                    status: {
+                        name: updates.pullRequestStatus
+                    }
+                };
+            }
+
+            if (updates.pullRequestLink) {
+                properties['Pull Request Link'] = {
+                    url: updates.pullRequestLink
+                };
+            }
+
+            const response = await this.notion.notion.pages.update({
+                page_id: pageId,
+                properties
+            });
+            return response;
+        } catch (error) {
+            this.logger.error('Error updating task PR properties:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Generic method to update any page with branch/PR properties
+     * @param {string} pageId - Notion page ID
+     * @param {Object} updates - Object containing properties to update
+     */
+    async updatePageBranchLink(pageId, updates) {
+        try {
+            const properties = {};
+            
+            if (updates.branchUrl) {
+                properties['Branch Link'] = {
+                    url: updates.branchUrl
+                };
+            }
+
+            if (updates.pullRequestStatus) {
+                properties['Pull Request Status'] = {
+                    status: {
+                        name: updates.pullRequestStatus
+                    }
+                };
+            }
+
+            if (updates.pullRequestLink) {
+                properties['Pull Request Link'] = {
+                    url: updates.pullRequestLink
+                };
+            }
+
+            const response = await this.notion.notion.pages.update({
+                page_id: pageId,
+                properties
+            });
+            return response;
+        } catch (error) {
+            this.logger.error('Error updating page properties:', error);
             throw error;
         }
     }
@@ -774,6 +1213,208 @@ class WebhookHandler {
         } catch (error) {
             this.logger.error(`Error updating issue body for #${issueNumber}:`, error);
             // Don't throw here as this is not critical - the main branch creation succeeded
+        }
+    }
+
+    /**
+     * Parse branch URL to extract repository and branch name
+     * @param {string} branchUrl - GitHub branch URL
+     * @returns {Object|null} Object with repository and branchName or null
+     */
+    parseBranchUrl(branchUrl) {
+        try {
+            // Expected format: https://github.com/owner/repo/tree/branch-name
+            const urlPattern = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/tree\/(.+)$/;
+            const match = branchUrl.match(urlPattern);
+            
+            if (match) {
+                const [, owner, repo, branchName] = match;
+                return {
+                    repository: `${owner}/${repo}`,
+                    branchName: branchName
+                };
+            }
+            
+            this.logger.warn(`Could not parse branch URL: ${branchUrl}`);
+            return null;
+        } catch (error) {
+            this.logger.error('Error parsing branch URL:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Check if branch exists and has changes compared to main
+     * @param {string} repository - Repository name (owner/repo)
+     * @param {string} branchName - Branch name
+     * @returns {Object} Status object with exists and hasChanges properties
+     */
+    async checkBranchStatus(repository, branchName) {
+        try {
+            const [owner, repo] = repository.split('/');
+            
+            // Check if branch exists
+            const branchExists = await this.github.checkBranchExists(repository, branchName);
+            if (!branchExists) {
+                return { exists: false, hasChanges: false };
+            }
+
+            // Check if branch has changes compared to main
+            const hasChanges = await this.github.branchHasChanges(repository, branchName, 'main');
+            
+            return { exists: true, hasChanges };
+        } catch (error) {
+            this.logger.error('Error checking branch status:', error);
+            return { exists: false, hasChanges: false };
+        }
+    }
+
+    /**
+     * Find existing pull request for a branch
+     * @param {string} repository - Repository name
+     * @param {string} branchName - Branch name
+     * @returns {Object|null} Existing PR object or null
+     */
+    async findExistingPR(repository, branchName) {
+        try {
+            const prs = await this.github.fetchPullRequests(repository, branchName);
+            return prs.length > 0 ? prs[0] : null;
+        } catch (error) {
+            this.logger.error('Error finding existing PR:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Generate pull request title
+     * @param {string} id - Bug/Task ID
+     * @param {string} title - Issue title
+     * @param {string} type - Issue type
+     * @returns {string} Formatted PR title
+     */
+    generatePRTitle(id, title, type) {
+        // Format: [Type] ID: Title → [Feature] TSK-8: Complete navigation view
+        const typeFormatted = type ? type.charAt(0).toUpperCase() + type.slice(1) : 'Feature';
+        return `[${typeFormatted}] ${id}: ${title}`;
+    }
+
+    /**
+     * Generate pull request body
+     * @param {string} description - Description from Notion
+     * @param {string} id - Bug/Task ID
+     * @param {string} type - Issue type
+     * @returns {string} Formatted PR body
+     */
+    generatePRBody(description, id, type) {
+        let body = '';
+        
+        if (description) {
+            body += `## Description\n${description}\n\n`;
+        }
+        
+        body += `## Type\n${type || 'Feature'}\n\n`;
+        body += `## Changes\n- [ ] Implementation complete\n- [ ] Testing complete\n- [ ] Documentation updated\n\n`;
+        body += `---\n*This pull request was automatically created from Notion ${id.startsWith('TSK-') ? 'task' : 'bug'} ${id}*`;
+        
+        return body;
+    }
+
+    /**
+     * Update Notion with pull request information
+     * @param {string} pageId - Notion page ID
+     * @param {string} id - Bug/Task ID
+     * @param {string} prUrl - Pull request URL
+     * @param {string} prStatus - Pull request status
+     */
+    async updateNotionWithPRInfo(pageId, id, prUrl, prStatus) {
+        try {
+            this.logger.info('Updating Notion with PR info', { pageId, id, prUrl, prStatus });
+
+            // Determine if this is a Bug or Task based on ID format
+            const isTask = id.startsWith('TSK-');
+            const isBug = id.startsWith('CBUG-') || id.startsWith('BUG-');
+
+            const updates = {
+                pullRequestStatus: prStatus,
+                pullRequestLink: prUrl
+            };
+
+            if (isBug) {
+                // Use existing NotionClient method for bugs
+                await this.notion.updateBugProperties(pageId, updates);
+            } else if (isTask) {
+                // For tasks, use the task-specific method
+                await this.notion.updateTaskProperties(pageId, updates, 'task');
+            } else {
+                // Generic update for other types
+                await this.updatePageBranchLink(pageId, updates);
+            }
+
+            this.logger.info('Successfully updated Notion with PR info', { pageId, id, prUrl, prStatus });
+
+        } catch (error) {
+            this.logger.error('Error updating Notion with PR info:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Check if a pull request is mergeable
+     * @param {string} repository - Repository name
+     * @param {number} prNumber - Pull request number
+     * @returns {Object} Mergeability status with mergeable boolean and reason
+     */
+    async checkPRMergeability(repository, prNumber) {
+        try {
+            // Get detailed PR info from GitHub
+            const prDetails = await this.github.getPullRequestDetails(repository, prNumber);
+            
+            this.logger.info(`PR #${prNumber} mergeable status`, {
+                mergeable: prDetails.mergeable,
+                mergeableState: prDetails.mergeable_state,
+                state: prDetails.state
+            });
+
+            if (prDetails.state === 'closed') {
+                return {
+                    mergeable: false,
+                    reason: 'Pull request is already closed'
+                };
+            }
+
+            if (prDetails.mergeable === false) {
+                return {
+                    mergeable: false,
+                    reason: `Merge conflicts or other issues (state: ${prDetails.mergeable_state})`
+                };
+            }
+
+            if (prDetails.mergeable === null) {
+                // GitHub is still computing mergeability, wait a moment
+                this.logger.info('GitHub is still computing mergeability, waiting...');
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                // Re-check
+                const recheckDetails = await this.github.getPullRequestDetails(repository, prNumber);
+                if (recheckDetails.mergeable === false) {
+                    return {
+                        mergeable: false,
+                        reason: `Merge conflicts detected (state: ${recheckDetails.mergeable_state})`
+                    };
+                }
+            }
+
+            return {
+                mergeable: true,
+                reason: 'Ready to merge'
+            };
+
+        } catch (error) {
+            this.logger.error('Error checking PR mergeability:', error);
+            return {
+                mergeable: false,
+                reason: `Error checking mergeability: ${error.message}`
+            };
         }
     }
 

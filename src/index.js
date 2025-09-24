@@ -31,7 +31,8 @@ class GitHubNotionSync {
             // Initialize clients
             this.notion = new NotionClient(
                 this.config.getNotionToken(),
-                this.config.getBugDatabaseId()
+                this.config.getBugDatabaseId(),
+                this.config.getTaskDatabaseId()
             );
 
             this.github = new GitHubClient(
@@ -166,18 +167,20 @@ class GitHubNotionSync {
             this.logger.info('Starting dry run (no changes will be made)...');
 
             // Fetch data from both sources
-            const [notionBugs, githubIssues] = await Promise.all([
-                this.notion.fetchAllBugs(),
+            const [notionData, githubIssues] = await Promise.all([
+                this.notion.fetchAllItems(),
                 this.github.fetchAllSyncedIssues(this.config.getAllRepositories())
             ]);
 
+            const allItems = [...notionData.bugs, ...notionData.tasks];
+
             // Create mappings and determine operations
-            const { bugMap, issueMap } = this.syncManager.createMappings(notionBugs, githubIssues);
+            const { bugMap, issueMap } = this.syncManager.createMappings(allItems, githubIssues);
             const operations = this.syncManager.determineSyncOperations(bugMap, issueMap);
 
             // Log what would be done
             this.logger.info('\n=== DRY RUN RESULTS ===');
-            this.logger.info(`Found ${notionBugs.length} bugs in Notion`);
+            this.logger.info(`Found ${notionData.bugs.length} bugs and ${notionData.tasks.length} tasks in Notion`);
             this.logger.info(`Found ${githubIssues.length} synced issues in GitHub`);
             this.logger.info(`Would perform ${operations.length} operations:`);
 
